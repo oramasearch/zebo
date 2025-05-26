@@ -10,7 +10,7 @@ authors = [
 documentation = "https://docs.rs/zebo"
 repository = "https://github.com/oramasearch/zebo"
 homepage = "https://crates.io/crates/zebo"
-keywords = [ "file system", "performance", "data storage" ]
+keywords = [ "filesystem", "performance", "data storage" ]
 categories = [ "filesystem" ]
 
 [lib]
