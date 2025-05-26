@@ -1,6 +1,19 @@
 [package]
 name = "zebo"
+description = "Write data on FS in a performance way"
 version = "0.0.1"
 edition = "2024"
+license = "Apache-2.0"
+authors = [
+  "Tommaso Allevi <tomallevi@gmail.com>",
+]
+documentation = "https://docs.rs/zebo"
+repository = "https://github.com/oramasearch/zebo"
+homepage = "https://crates.io/crates/zebo"
+keywords = [ "file system", "performance", "data storage" ]
+categories = [ "filesystem" ]
+
+[lib]
+name = "zebo"
 
 [dependencies]
