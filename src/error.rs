@@ -26,7 +26,7 @@ pub enum ZeboError {
         new_allocation_requested: u32,
     },
     OperationError(std::io::Error),
-    // NotFound,
+    UnexpectedPageId,
 }
 impl Display for ZeboError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -69,7 +69,7 @@ impl Display for ZeboError {
                 "Not enough space. Limit: {limit}. New allocation requested: {new_allocation_requested}"
             ),
             ZeboError::OperationError(error) => write!(f, "Operation error: {error}"),
-            // ZeboError::NotFound => write!(f, "Document not found"),
+            ZeboError::UnexpectedPageId => write!(f, "Unexpected page ID"),
         }
     }
 }

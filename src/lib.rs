@@ -18,7 +18,7 @@ pub use error::*;
 use index::{ProbableIndex, ZeboIndex};
 use page::{DOCUMENT_INDEX_OFFSET, ZeboPage, ZeboPageHeader};
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq)]
 pub struct ZeboInfo {
     pub max_doc_per_page: u32,
     pub page_size: u64,
@@ -39,7 +39,7 @@ pub trait DocumentId: Ord + Eq + std::hash::Hash + Debug + Copy {
 /// In that case, the page size will higher than `PAGE_SIZE` bytes.
 pub struct Zebo<const MAX_DOC_PER_PAGE: u32, const PAGE_SIZE: u64, DocId> {
     base_dir: PathBuf,
-    id: u64,
+    next_page_id: u64,
     index: ZeboIndex<DocId>,
     current_page: Option<(DocId, ZeboPage)>,
     remove_documents_cache: HashMap<PageId, Vec<(u64, ProbableIndex)>>,
@@ -75,16 +75,29 @@ impl<const MAX_DOC_PER_PAGE: u32, const PAGE_SIZE: u64, DocId: DocumentId>
 
         let index_dir_path = base_dir.join("index");
         let metadata = std::fs::metadata(&index_dir_path);
-        let index = match metadata {
+        let (index, page_id, current_page) = match metadata {
             Ok(metadata) => {
                 if !metadata.is_dir() {
                     return Err(ZeboError::BaseDirIsNotDir { base_dir });
                 }
-                ZeboIndex::try_load(index_dir_path)?
+                let index = ZeboIndex::try_load(index_dir_path)?;
+
+                let page_id = match index.get_page_ids()?.into_iter().max() {
+                    Some(page_id) => page_id,
+                    None => {
+                        return Err(ZeboError::UnexpectedPageId);
+                    }
+                };
+
+                let page = load_page(&base_dir, page_id, Mode::Change)?;
+                let starting_document_id = DocId::from_u64(page.starting_document_id);
+
+                (index, Some(page_id), Some((starting_document_id, page)))
             }
             Err(error) => {
                 if error.kind() == std::io::ErrorKind::NotFound {
-                    ZeboIndex::try_new(index_dir_path)?
+                    let index = ZeboIndex::try_new(index_dir_path)?;
+                    (index, None, None)
                 } else {
                     return Err(ZeboError::BaseDirIsNotDir {
                         base_dir: index_dir_path,
@@ -96,8 +109,8 @@ impl<const MAX_DOC_PER_PAGE: u32, const PAGE_SIZE: u64, DocId: DocumentId>
         Ok(Zebo {
             base_dir,
             index,
-            id: 0,
-            current_page: None,
+            next_page_id: page_id.map(|id| id.0 + 1).unwrap_or(0),
+            current_page,
             remove_documents_cache: HashMap::new(),
         })
     }
@@ -148,15 +161,7 @@ impl<const MAX_DOC_PER_PAGE: u32, const PAGE_SIZE: u64, DocId: DocumentId>
                     self.current_page.as_mut().expect("Page should be created")
                 }
             };
-            /*
-                        let s = std::env::current_dir().unwrap()
-                            .join("debug");
-                        std::fs::create_dir_all(&s).unwrap();
-                        let s = s
-                            .join(format!("debug_{}", doc_id.as_u64()));
-                        let v = doc_bytes.iter().flat_map(|b| b.as_ref()).copied().collect::<Vec<_>>();
-                        std::fs::write(s, v).unwrap();
-            */
+
             page.reserve_space(doc_id.as_u64(), doc_len)?
                 .write(doc_bytes)?;
 
@@ -175,7 +180,7 @@ impl<const MAX_DOC_PER_PAGE: u32, const PAGE_SIZE: u64, DocId: DocumentId>
 
         let mut removed = 0;
         for (page_id, documents_to_delete) in &self.remove_documents_cache {
-            let mut page = self.load_page(*page_id, Mode::Change)?;
+            let mut page = load_page(&self.base_dir, *page_id, Mode::Change)?;
             removed += page.delete_documents(documents_to_delete, clean_data)?;
         }
 
@@ -211,8 +216,8 @@ impl<const MAX_DOC_PER_PAGE: u32, const PAGE_SIZE: u64, DocId: DocumentId>
     /// Returns the total document count
     pub fn get_document_count(&self) -> Result<u32> {
         let mut total_count = 0;
-        for page_id in 0..self.id {
-            let page = self.load_page(PageId(page_id), Mode::Read)?;
+        for page_id in 0..self.next_page_id {
+            let page = load_page(&self.base_dir, PageId(page_id), Mode::Read)?;
             total_count += page.get_document_count()?;
         }
 
@@ -221,13 +226,13 @@ impl<const MAX_DOC_PER_PAGE: u32, const PAGE_SIZE: u64, DocId: DocumentId>
 
     /// Returns information related the this Zebo instance
     pub fn get_info(&self) -> Result<ZeboInfo> {
-        let mut page_headers = Vec::with_capacity(self.id as usize);
+        let mut page_headers = Vec::with_capacity(self.next_page_id as usize);
 
         let mut document_count: u64 = 0;
 
         let pages = self.index.get_page_ids()?;
         for page_id in pages {
-            let page = self.load_page(page_id, Mode::Read)?;
+            let page = load_page(&self.base_dir, page_id, Mode::Read)?;
             let header = page.get_header()?;
             document_count += header.document_count as u64;
             page_headers.push(header);
@@ -247,7 +252,7 @@ impl<const MAX_DOC_PER_PAGE: u32, const PAGE_SIZE: u64, DocId: DocumentId>
             page.close()?;
         }
 
-        let new_page_id = PageId(self.id);
+        let new_page_id = PageId(self.next_page_id);
         self.index.new_page(doc_id, new_page_id)?;
 
         let page_file_path = self.base_dir.join(format!("page_{}.zebo", new_page_id.0));
@@ -270,38 +275,38 @@ impl<const MAX_DOC_PER_PAGE: u32, const PAGE_SIZE: u64, DocId: DocumentId>
 
         let page = ZeboPage::try_new(MAX_DOC_PER_PAGE, doc_id.as_u64(), page_file)?;
         self.current_page = Some((doc_id, page));
-        self.id += 1;
+        self.next_page_id += 1;
 
         Ok(())
     }
+}
 
-    fn load_page(&self, page_id: PageId, mode: Mode) -> Result<ZeboPage> {
-        // close page and create a new one
-        let page_file_path = self.base_dir.join(format!("page_{}.zebo", page_id.0));
+fn load_page(base_dir: &Path, page_id: PageId, mode: Mode) -> Result<ZeboPage> {
+    // close page and create a new one
+    let page_file_path = base_dir.join(format!("page_{}.zebo", page_id.0));
 
-        let mut options = std::fs::File::options();
-        match mode {
-            Mode::Read => {
-                // Same of File::open
-                options.read(true);
-            }
-            Mode::Change => {
-                options.write(true).read(true);
-            }
-        };
+    let mut options = std::fs::File::options();
+    match mode {
+        Mode::Read => {
+            // Same of File::open
+            options.read(true);
+        }
+        Mode::Change => {
+            options.write(true).read(true);
+        }
+    };
 
-        let page_file = match options.open(&page_file_path) {
-            Ok(file) => file,
-            Err(error) => {
-                return Err(ZeboError::OpenPageFileError {
-                    inner_error: error,
-                    page_file_path,
-                });
-            }
-        };
+    let page_file = match options.open(&page_file_path) {
+        Ok(file) => file,
+        Err(error) => {
+            return Err(ZeboError::OpenPageFileError {
+                inner_error: error,
+                page_file_path,
+            });
+        }
+    };
 
-        ZeboPage::try_load(page_file)
-    }
+    ZeboPage::try_load(page_file)
 }
 
 impl<const MAX_DOC_PER_PAGE: u32, const PAGE_SIZE: u64, DocId: DocumentId> Debug
@@ -309,10 +314,9 @@ impl<const MAX_DOC_PER_PAGE: u32, const PAGE_SIZE: u64, DocId: DocumentId> Debug
 {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let mut headers = Vec::new();
-        for page_id in 0..self.id {
-            let page = self
-                .load_page(PageId(page_id), Mode::Read)
-                .expect("Cannot open page");
+        for page_id in 0..self.next_page_id {
+            let page =
+                load_page(&self.base_dir, PageId(page_id), Mode::Read).expect("Cannot open page");
             headers.push(page.get_header().expect("Cannot get page header"));
         }
 
@@ -429,7 +433,8 @@ impl<
 
     fn next(&mut self) -> Option<Self::Item> {
         let (page_id, v): (PageId, V) = self.document_offsets_per_page.next()?;
-        let page = match self.zebo.load_page(page_id, Mode::Read) {
+
+        let page = match load_page(&self.zebo.base_dir, page_id, Mode::Read) {
             Ok(page) => page,
             Err(e) => return Some(Err(e)),
         };
@@ -447,7 +452,7 @@ impl<T: AsRef<[u8]>> Document for T {
     }
 }
 
-#[derive(PartialEq, Eq, Hash, Clone, Copy, Debug)]
+#[derive(PartialEq, Eq, Hash, Clone, Copy, Debug, PartialOrd, Ord)]
 pub struct PageId(u64);
 
 enum Mode {
@@ -507,7 +512,7 @@ mod tests {
         let test_dir = prepare_test_dir();
 
         let mut zebo: Zebo<2, 2048, u32> = Zebo::<2, 2048, _>::try_new(test_dir.clone()).unwrap();
-        assert_eq!(zebo.id, 0);
+        assert_eq!(zebo.next_page_id, 0);
 
         let docs = vec![(1, "Hello")];
         zebo.add_documents(docs).unwrap();
@@ -525,7 +530,7 @@ mod tests {
         let test_dir = prepare_test_dir();
 
         let mut zebo: Zebo<6, 2048, u32> = Zebo::<6, 2048, _>::try_new(test_dir.clone()).unwrap();
-        assert_eq!(zebo.id, 0);
+        assert_eq!(zebo.next_page_id, 0);
 
         let docs = vec![(1, "Hello"), (2, "World"), (3, "Zebo")];
         zebo.add_documents(docs).unwrap();
@@ -559,7 +564,7 @@ mod tests {
         let test_dir = prepare_test_dir();
 
         let mut zebo: Zebo<10, 128, u32> = Zebo::<10, 128, _>::try_new(test_dir.clone()).unwrap();
-        assert_eq!(zebo.id, 0);
+        assert_eq!(zebo.next_page_id, 0);
 
         let docs = vec![
             (1, "1".repeat(100)),
@@ -652,7 +657,7 @@ mod tests {
         let test_dir = prepare_test_dir();
 
         let mut zebo: Zebo<2, 2048, u32> = Zebo::<2, 2048, _>::try_new(test_dir.clone()).unwrap();
-        assert_eq!(zebo.id, 0);
+        assert_eq!(zebo.next_page_id, 0);
 
         let docs = vec![(1, ""), (2, ""), (3, "")];
         zebo.add_documents(docs).unwrap();
@@ -690,7 +695,7 @@ mod tests {
 
         let mut zebo: Zebo<100, 2048, u32> =
             Zebo::<100, 2048, _>::try_new(test_dir.clone()).unwrap();
-        assert_eq!(zebo.id, 0);
+        assert_eq!(zebo.next_page_id, 0);
 
         let docs = vec![(1, ""), (2, ""), (3, "")];
         zebo.add_documents(docs).unwrap();
@@ -763,7 +768,7 @@ mod tests {
         let test_dir = prepare_test_dir();
 
         let mut zebo: Zebo<2, 2048, u32> = Zebo::<2, 2048, _>::try_new(test_dir.clone()).unwrap();
-        assert_eq!(zebo.id, 0);
+        assert_eq!(zebo.next_page_id, 0);
 
         zebo.add_documents(vec![(1, "1"), (2, "2"), (3, "3")])
             .unwrap();
@@ -798,7 +803,7 @@ mod tests {
         let test_dir = prepare_test_dir();
 
         let mut zebo: Zebo<2, 2048, u32> = Zebo::<2, 2048, _>::try_new(test_dir.clone()).unwrap();
-        assert_eq!(zebo.id, 0);
+        assert_eq!(zebo.next_page_id, 0);
 
         zebo.add_documents(vec![(1, "1"), (2, "2"), (3, "3")])
             .unwrap();
@@ -837,7 +842,7 @@ mod tests {
         let test_dir = prepare_test_dir();
 
         let mut zebo: Zebo<2, 2048, u32> = Zebo::<2, 2048, _>::try_new(test_dir.clone()).unwrap();
-        assert_eq!(zebo.id, 0);
+        assert_eq!(zebo.next_page_id, 0);
 
         zebo.add_documents(vec![(1, "1"), (3, "3"), (5, "5")])
             .unwrap();
@@ -912,7 +917,7 @@ mod tests {
         const PAGE_SIZE: u64 = 1024 * 1024 * 1024;
 
         let mut zebo: Zebo<1_000_000, PAGE_SIZE, u32> = Zebo::try_new(test_dir.clone()).unwrap();
-        assert_eq!(zebo.id, 0);
+        assert_eq!(zebo.next_page_id, 0);
 
         zebo.add_documents(vec![(
             1,
@@ -935,7 +940,7 @@ mod tests {
         const PAGE_SIZE: u64 = 1024 * 1024 * 1024;
 
         let mut zebo: Zebo<1_000_000, PAGE_SIZE, u32> = Zebo::try_new(test_dir.clone()).unwrap();
-        assert_eq!(zebo.id, 0);
+        assert_eq!(zebo.next_page_id, 0);
 
         zebo.add_documents(vec![
             (
@@ -962,6 +967,75 @@ mod tests {
         assert!(a.is_some());
 
         zebo.remove_documents(vec![0], true).unwrap();
+    }
+
+    #[test]
+    fn test_real_example_3() {
+        let test_dir = prepare_test_dir();
+
+        // 1GB
+        const PAGE_SIZE: u64 = 1024 * 1024 * 1024;
+
+        let mut zebo = Zebo::<5, PAGE_SIZE, u64>::try_new(test_dir.clone())
+            .expect("Failed to create Zebo instance");
+
+        zebo.add_documents(vec![(
+            1,
+            MyDoc {
+                id: "Document 1".to_string(),
+                text: "This is the content of document 1.".to_string(),
+            },
+        )])
+        .expect("Failed to add documents");
+
+        let info_before = zebo.get_info().unwrap();
+        assert_eq!(info_before.page_headers.len(), 1);
+        drop(zebo);
+
+        let mut zebo = Zebo::<5, PAGE_SIZE, u64>::try_new(test_dir.clone())
+            .expect("Failed to create Zebo instance");
+
+        // Test realod of Zebo instance doesn't change the info
+        let info_after = zebo.get_info().unwrap();
+        assert_eq!(info_before, info_after);
+
+        zebo.add_documents(vec![(
+            4,
+            MyDoc {
+                id: "Document 4".to_string(),
+                text: "This is the content of document 4.".to_string(),
+            },
+        )])
+        .expect("Failed to add documents");
+
+        // Reload doesn't create a new page
+        let info = zebo.get_info().unwrap();
+        assert_eq!(info.page_headers.len(), 1);
+
+        drop(zebo);
+
+        let mut zebo =
+            Zebo::<5, PAGE_SIZE, u64>::try_new(test_dir).expect("Failed to create Zebo instance");
+
+        zebo.add_documents(vec![(
+            5,
+            MyDoc {
+                id: "Document 5".to_string(),
+                text: "This is the content of document 5.".to_string(),
+            },
+        )])
+        .expect("Failed to add documents");
+
+        let info = zebo.get_info();
+        // Reload doesn't create a new page
+        let info = zebo.get_info().unwrap();
+        assert_eq!(info.page_headers.len(), 1);
+        let docs: Vec<_> = info
+            .page_headers
+            .into_iter()
+            .flat_map(|header| header.index.into_iter().map(|(doc_id, _, _)| doc_id))
+            .collect();
+        assert_eq!(docs, vec![1, 4, 5]);
     }
 
     struct MyDoc {
