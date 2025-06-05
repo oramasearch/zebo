@@ -82,17 +82,15 @@ impl<const MAX_DOC_PER_PAGE: u32, const PAGE_SIZE: u64, DocId: DocumentId>
                 }
                 let index = ZeboIndex::try_load(index_dir_path)?;
 
-                let page_id = match index.get_page_ids()?.into_iter().max() {
-                    Some(page_id) => page_id,
-                    None => {
-                        return Err(ZeboError::UnexpectedPageId);
+                match index.get_page_ids()?.into_iter().max() {
+                    Some(page_id) => {
+                        let page = load_page(&base_dir, page_id, Mode::Change)?;
+                        let starting_document_id = DocId::from_u64(page.starting_document_id);
+
+                        (index, Some(page_id), Some((starting_document_id, page)))
                     }
-                };
-
-                let page = load_page(&base_dir, page_id, Mode::Change)?;
-                let starting_document_id = DocId::from_u64(page.starting_document_id);
-
-                (index, Some(page_id), Some((starting_document_id, page)))
+                    None => (index, None, None),
+                }
             }
             Err(error) => {
                 if error.kind() == std::io::ErrorKind::NotFound {
@@ -1026,7 +1024,6 @@ mod tests {
         )])
         .expect("Failed to add documents");
 
-        let info = zebo.get_info();
         // Reload doesn't create a new page
         let info = zebo.get_info().unwrap();
         assert_eq!(info.page_headers.len(), 1);
@@ -1036,6 +1033,28 @@ mod tests {
             .flat_map(|header| header.index.into_iter().map(|(doc_id, _, _)| doc_id))
             .collect();
         assert_eq!(docs, vec![1, 4, 5]);
+    }
+
+    #[test]
+    fn test_empty() {
+        let test_dir = prepare_test_dir();
+
+        // 1GB
+        const PAGE_SIZE: u64 = 1024 * 1024 * 1024;
+
+        let zebo = Zebo::<5, PAGE_SIZE, u64>::try_new(test_dir.clone())
+            .expect("Failed to create Zebo instance");
+
+        let info_before = zebo.get_info().unwrap();
+        assert_eq!(info_before.page_headers.len(), 0);
+        drop(zebo);
+
+        let zebo = Zebo::<5, PAGE_SIZE, u64>::try_new(test_dir.clone())
+            .expect("Failed to create Zebo instance");
+
+        // Test realod of Zebo instance doesn't change the info
+        let info_after = zebo.get_info().unwrap();
+        assert_eq!(info_before, info_after);
     }
 
     struct MyDoc {

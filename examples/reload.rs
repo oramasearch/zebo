@@ -25,8 +25,8 @@ impl zebo::Document for Document {
     fn as_bytes(&self) -> Cow<[Cow<[u8]>]> {
         let mut bytes = Vec::with_capacity(3);
         bytes.push(Cow::Borrowed(self.id.as_bytes()));
-        // bytes.push(Cow::Borrowed(ZERO));
-        // bytes.push(Cow::Borrowed(self.data.as_bytes()));
+        bytes.push(Cow::Borrowed(ZERO));
+        bytes.push(Cow::Borrowed(self.data.as_bytes()));
         Cow::Owned(bytes)
     }
 }
@@ -57,8 +57,6 @@ fn main() {
     let info_after = zebo.get_info().unwrap();
     assert_eq!(info_before, info_after);
 
-    println!("--------");
-
     zebo.add_documents(vec![(
         DocumentId(4),
         Document {
@@ -74,8 +72,6 @@ fn main() {
     drop(zebo);
     let mut zebo = Zebo::<5, PAGE_SIZE, DocumentId>::try_new(data_dir)
         .expect("Failed to create Zebo instance");
-
-    println!("--------");
 
     zebo.add_documents(vec![(
         DocumentId(5),
