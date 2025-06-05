@@ -45,7 +45,7 @@ pub const DOCUMENT_INDEX_OFFSET: u64 = STARTING_DOCUMENT_ID_OFFSET + 8;
 pub struct ZeboPage {
     document_limit: u32,
     #[allow(dead_code)]
-    starting_document_id: u64,
+    pub(crate) starting_document_id: u64,
     page_file: std::fs::File,
     next_available_header_offset: u32,
 }
@@ -432,7 +432,7 @@ impl ZeboReservedSpace<'_> {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq)]
 pub struct ZeboPageHeader {
     pub document_limit: u32,
     pub document_count: u32,
