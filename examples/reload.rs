@@ -1,5 +1,3 @@
-use std::borrow::Cow;
-
 use zebo::Zebo;
 
 #[derive(Debug, Hash, PartialEq, Eq, PartialOrd, Ord, Clone, Copy)]
@@ -22,12 +20,10 @@ struct Document {
     data: String,
 }
 impl zebo::Document for Document {
-    fn as_bytes(&self) -> Cow<[Cow<[u8]>]> {
-        let mut bytes = Vec::with_capacity(3);
-        bytes.push(Cow::Borrowed(self.id.as_bytes()));
-        bytes.push(Cow::Borrowed(ZERO));
-        bytes.push(Cow::Borrowed(self.data.as_bytes()));
-        Cow::Owned(bytes)
+    fn as_bytes(&self, v: &mut Vec<u8>) {
+        v.extend(self.id.as_bytes());
+        v.extend(ZERO);
+        v.extend(self.data.as_bytes());
     }
 }
 

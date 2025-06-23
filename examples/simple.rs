@@ -12,11 +12,16 @@ fn main() {
     >::try_new(data_dir)
     .expect("Failed to create Zebo instance");
 
-    zebo.add_documents(vec![
-        (1, b"Document 1".to_vec()),
-        (2, b"Document 2".to_vec()),
-        (3, b"Document 3".to_vec()),
-    ])
+    // Batch insertions
+    zebo.add_documents_batch(
+        vec![
+            (1, b"Document 1".to_vec()),
+            (2, b"Document 2".to_vec()),
+            (3, b"Document 3".to_vec()),
+        ],
+        200,
+        1024,
+    )
     .expect("Failed to add documents");
 
     zebo.add_documents(vec![

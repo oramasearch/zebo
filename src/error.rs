@@ -21,6 +21,10 @@ pub enum ZeboError {
         wanted: usize,
         reserved: u32,
     },
+    WrongReservedSpace {
+        wanted: usize,
+        reserved: u32,
+    },
     NotEnoughSpace {
         limit: u32,
         new_allocation_requested: u32,
@@ -68,6 +72,11 @@ impl Display for ZeboError {
                 f,
                 "Not enough space. Limit: {limit}. New allocation requested: {new_allocation_requested}"
             ),
+            ZeboError::WrongReservedSpace { reserved, wanted } => write!(
+                f,
+                "Reserved {reserved} space but given {wanted}. Disalignament are not permitted."
+            ),
+
             ZeboError::OperationError(error) => write!(f, "Operation error: {error}"),
             ZeboError::UnexpectedPageId => write!(f, "Unexpected page ID"),
         }
