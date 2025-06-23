@@ -1,4 +1,4 @@
-use std::{borrow::Cow, io::Write, os::unix::fs::FileExt};
+use std::{io::Write, os::unix::fs::FileExt};
 
 use crate::{DocumentId, Result, Version, ZeboError, index::ProbableIndex};
 
@@ -393,7 +393,7 @@ impl ZeboPage {
         Ok(Some((doc_id, document_offset, document_len)))
     }
 
-    pub fn close(mut self) -> Result<()> {
+    pub fn close(&mut self) -> Result<()> {
         self.page_file.flush().map_err(ZeboError::OperationError)?;
         self.page_file
             .sync_all()
@@ -401,32 +401,136 @@ impl ZeboPage {
 
         Ok(())
     }
+
+    /// Reserves space for multiple documents, batching disk writes for efficiency.
+    pub fn reserve_multiple_space<'a, I: Iterator<Item = &'a (u64, u32)>>(
+        &mut self,
+        len: usize,
+        docs: I,
+    ) -> Result<ZeboMultiReservedSpace> {
+        // Step 1: Read current state
+        let mut next_available_offset = self.get_next_available_offset()?;
+        let mut document_count = self.get_document_count()?;
+        let mut available_header_offset = self.next_available_header_offset;
+        let initial_available_header_offset = available_header_offset;
+
+        // Put here because otherwise we cannot update self if it is captured by `ZeboReservedSpace`
+        self.next_available_header_offset += len as u32;
+
+        let mut total_len = 0;
+        let initial_next_available_offset = next_available_offset;
+
+        // Step 2: Prepare index entries and reserved spaces
+        let mut index_buf = Vec::with_capacity(len * 16);
+        for &(doc_id, len) in docs {
+            // Prepare index entry
+            let mut buf = [0u8; 16];
+            buf[0..8].copy_from_slice(&doc_id.to_be_bytes());
+            buf[8..12].copy_from_slice(&next_available_offset.to_be_bytes());
+            buf[12..16].copy_from_slice(&len.to_be_bytes());
+            index_buf.extend_from_slice(&buf);
+
+            total_len += len;
+
+            // Update counters for next doc
+            next_available_offset =
+                next_available_offset
+                    .checked_add(len)
+                    .ok_or(ZeboError::NotEnoughSpace {
+                        limit: u32::MAX,
+                        new_allocation_requested: len,
+                    })?;
+            available_header_offset =
+                available_header_offset
+                    .checked_add(1)
+                    .ok_or(ZeboError::NotEnoughSpace {
+                        limit: u32::MAX,
+                        new_allocation_requested: 1,
+                    })?;
+            document_count = document_count
+                .checked_add(1)
+                .ok_or(ZeboError::NotEnoughSpace {
+                    limit: u32::MAX,
+                    new_allocation_requested: 1,
+                })?;
+        }
+
+        // Step 3: Write all index entries in one go
+        let start_index_offset =
+            DOCUMENT_INDEX_OFFSET + (initial_available_header_offset as u64) * 16;
+
+        self.page_file
+            .write_all_at(&index_buf, start_index_offset)
+            .map_err(ZeboError::OperationError)?;
+
+        // Step 4: Write updated header/offset/count values
+        let buf = self.next_available_header_offset.to_be_bytes();
+        self.page_file
+            .write_all_at(&buf, NEXT_AVAILABLE_HEADER_OFFSET)
+            .map_err(ZeboError::OperationError)?;
+
+        let buf = next_available_offset.to_be_bytes();
+        self.page_file
+            .write_all_at(&buf, NEXT_AVAILABLE_OFFSET)
+            .map_err(ZeboError::OperationError)?;
+
+        let buf = document_count.to_be_bytes();
+        self.page_file
+            .write_all_at(&buf, DOCUMENT_COUNT_OFFSET)
+            .map_err(ZeboError::OperationError)?;
+
+        Ok(ZeboMultiReservedSpace {
+            page: self,
+            len: total_len,
+            document_offset: initial_next_available_offset,
+        })
+    }
+}
+
+pub struct ZeboMultiReservedSpace<'page> {
+    page: &'page ZeboPage,
+    len: u32,
+    document_offset: u32,
+}
+
+impl ZeboMultiReservedSpace<'_> {
+    pub fn write(self, data: Vec<u8>) -> Result<()> {
+        if data.len() != self.len as usize {
+            return Err(ZeboError::WrongReservedSpace {
+                wanted: data.len(),
+                reserved: self.len,
+            });
+        }
+
+        self.page
+            .page_file
+            .write_all_at(&data, self.document_offset as u64)
+            .map_err(ZeboError::OperationError)?;
+
+        Ok(())
+    }
 }
 
 pub struct ZeboReservedSpace<'page> {
-    page: &'page mut ZeboPage,
+    page: &'page ZeboPage,
     len: u32,
     document_offset: u32,
 }
 
 impl ZeboReservedSpace<'_> {
-    pub fn write(self, data: Cow<[Cow<[u8]>]>) -> Result<()> {
-        let data_len = data.iter().map(|d| d.len()).sum::<usize>() as u32;
+    pub fn write(self, data: &[u8]) -> Result<()> {
+        let data_len = data.len() as u32;
         if data_len > self.len {
             return Err(ZeboError::NotEnoughReservedSpace {
                 wanted: data.len(),
                 reserved: self.len,
             });
         }
-        let mut offset = self.document_offset as u64;
-        for d in data.iter() {
-            let len = d.len();
-            self.page
-                .page_file
-                .write_all_at(d, offset)
-                .map_err(ZeboError::OperationError)?;
-            offset += len as u64;
-        }
+
+        self.page
+            .page_file
+            .write_all_at(data, self.document_offset as u64)
+            .map_err(ZeboError::OperationError)?;
 
         Ok(())
     }
@@ -572,9 +676,7 @@ mod tests {
         assert_eq!(header.index.len(), 0);
 
         let reserved_space = page.reserve_space(1, 2).unwrap();
-        reserved_space
-            .write(Cow::Borrowed(&[Cow::Borrowed(b"ab")]))
-            .unwrap();
+        reserved_space.write("ab".as_bytes()).unwrap();
 
         drop(page);
 
@@ -668,27 +770,19 @@ mod tests {
         let mut page = ZeboPage::try_new(10, 0, zebo_page_file).unwrap();
 
         let reserved_space = page.reserve_space(1, 2).unwrap();
-        reserved_space
-            .write(Cow::Borrowed(&[Cow::Borrowed(b"ab")]))
-            .unwrap();
+        reserved_space.write("ab".as_bytes()).unwrap();
 
         let reserved_space = page.reserve_space(2, 2).unwrap();
-        reserved_space
-            .write(Cow::Borrowed(&[Cow::Borrowed(b"cd")]))
-            .unwrap();
+        reserved_space.write("cd".as_bytes()).unwrap();
 
         let reserved_space = page.reserve_space(3, 2).unwrap();
-        reserved_space
-            .write(Cow::Borrowed(&[Cow::Borrowed(b"ef")]))
-            .unwrap();
+        reserved_space.write("ef".as_bytes()).unwrap();
 
         page.delete_documents(&[(2, ProbableIndex(0))], true)
             .unwrap();
 
         let reserved_space = page.reserve_space(4, 2).unwrap();
-        reserved_space
-            .write(Cow::Borrowed(&[Cow::Borrowed(b"ef")]))
-            .unwrap();
+        reserved_space.write("ef".as_bytes()).unwrap();
 
         drop(page);
 
