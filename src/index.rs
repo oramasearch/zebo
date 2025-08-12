@@ -118,6 +118,9 @@ impl<DocId: DocumentId> ZeboIndex<DocId> {
             let page_id = u64::from_be_bytes(chunk[0..8].try_into().unwrap());
             pages.push(PageId(page_id));
         }
+        // Page IDs are created incrementally, so first pages have lower IDs
+        // NB: lower page IDs refer to earlier pages in the index, ie the first documents
+        pages.sort_by_key(|page| page.0);
 
         Ok(pages)
     }
