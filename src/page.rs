@@ -339,9 +339,13 @@ impl ZeboPage {
             if offset == 0 {
                 continue;
             }
+            // This document is already deleted
+            if offset == u32::MAX {
+                continue;
+            }
             if documents_to_delete.iter().any(|(d, _)| *d == doc_id) {
-                // Erase the document index
-                buf[0..8].copy_from_slice(&u64::MAX.to_be_bytes());
+                // Keep the document ID but mark offset and length as deleted
+                buf[0..8].copy_from_slice(&doc_id.to_be_bytes());
                 buf[8..12].copy_from_slice(&u32::MAX.to_be_bytes());
                 buf[12..16].copy_from_slice(&u32::MAX.to_be_bytes());
                 self.page_file
@@ -791,9 +795,8 @@ mod tests {
         assert_eq!(
             &file_content[41..89],
             &[
-                255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 0,
-                0, 0, 0, 0, 0, 0, 3, 0, 0, 0, 189, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 4, 0, 0, 0,
-                191, 0, 0, 0, 2
+                0, 0, 0, 0, 0, 0, 0, 2, 255, 255, 255, 255, 255, 255, 255, 255, 0, 0, 0, 0, 0, 0,
+                0, 3, 0, 0, 0, 189, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 4, 0, 0, 0, 191, 0, 0, 0, 2
             ]
         );
     }
