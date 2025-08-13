@@ -174,6 +174,7 @@ impl ZeboPage {
 
     /// Helper function to detect if a document entry represents a deletion.
     /// Supports both old format (doc_id=u64::MAX) and new format (preserved doc_id).
+    #[inline]
     fn is_deleted(doc_id: u64, document_offset: u32, document_len: u32) -> bool {
         // Old deletion format: doc_id = u64::MAX, offset = u32::MAX, length = u32::MAX
         // New deletion format: doc_id = preserved, offset = u32::MAX, length = u32::MAX
@@ -194,6 +195,7 @@ impl ZeboPage {
     /// Helper function to detect if a document entry represents an uninitialized slot.
     /// Returns true if the document offset is 0, indicating this header slot
     /// has never been written to (different from deleted entries which use u32::MAX).
+    #[inline]
     fn is_uninitialized_entry(document_offset: u32) -> bool {
         document_offset == 0
     }
