@@ -505,7 +505,7 @@ impl ZeboPage {
                 None => {
                     // No data at the most probable index, so we start from the hint
                     (index, doc_id)
-                },
+                }
                 Some((found_doc_id, document_offset, document_len)) => {
                     if found_doc_id == target_doc_id {
                         if Self::is_uninitialized_entry(document_offset)
