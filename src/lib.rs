@@ -236,7 +236,7 @@ impl<const MAX_DOC_PER_PAGE: u32, const PAGE_SIZE: u64, DocId: DocumentId>
         Ok(removed)
     }
 
-    /// Returns an iterator without the order guarantees
+    /// Returns an iterator with the order guarantees
     pub fn get_documents<I: IntoIterator<Item = DocId> + Clone>(
         &self,
         doc_ids: I,
@@ -244,7 +244,11 @@ impl<const MAX_DOC_PER_PAGE: u32, const PAGE_SIZE: u64, DocId: DocumentId>
         let mut results: HashMap<PageId, Vec<(u64, ProbableIndex)>> = Default::default();
         self.index.get_pages(doc_ids, &mut results)?;
 
-        let page_iterator = ZeboPageIterator::new(self, results.into_iter());
+        // Sort pages which guarantee the order of documents
+        let mut pages: Vec<_> = results.into_iter().collect();
+        pages.sort_by_key(|(page_id, _)| page_id.0);
+
+        let page_iterator = ZeboPageIterator::new(self, pages.into_iter());
         Ok(ZeboDocumentIterator {
             iter: page_iterator,
             current_v: None,
@@ -606,7 +610,7 @@ mod tests {
         let address1 = &num1 as *const Vec<i32>;
         let number1 = address1 as i32;
 
-        let test_dir = std::env::temp_dir().join(format!("zebo_test_{}", number1));
+        let test_dir = std::env::temp_dir().join(format!("zebo_test_{number1}"));
         // let test_dir = std::env::current_dir().unwrap().join("zebo_test");
         if test_dir.exists() {
             std::fs::remove_dir_all(&test_dir).unwrap();
