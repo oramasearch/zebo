@@ -172,6 +172,34 @@ impl ZeboPage {
         Ok(metadata.len())
     }
 
+    /// Helper function to detect if a document entry represents a deletion.
+    /// Supports both old format (doc_id=u64::MAX) and new format (preserved doc_id).
+    #[inline]
+    fn is_deleted(doc_id: u64, document_offset: u32, document_len: u32) -> bool {
+        // Old deletion format: doc_id = u64::MAX, offset = u32::MAX, length = u32::MAX
+        // New deletion format: doc_id = preserved, offset = u32::MAX, length = u32::MAX
+
+        if document_offset == u32::MAX && document_len == u32::MAX {
+            // Either old format (doc_id also u64::MAX) or new format (doc_id preserved)
+            return true;
+        }
+
+        // Legacy check: old format specifically set doc_id to u64::MAX
+        if doc_id == u64::MAX && document_offset == u32::MAX {
+            return true;
+        }
+
+        false
+    }
+
+    /// Helper function to detect if a document entry represents an uninitialized slot.
+    /// Returns true if the document offset is 0, indicating this header slot
+    /// has never been written to (different from deleted entries which use u32::MAX).
+    #[inline]
+    fn is_uninitialized_entry(document_offset: u32) -> bool {
+        document_offset == 0
+    }
+
     pub fn get_header(&self) -> Result<ZeboPageHeader> {
         let document_count = self.get_document_count()?;
         let next_available_offset = self.get_next_available_offset()?;
@@ -185,12 +213,12 @@ impl ZeboPage {
             }
 
             if let Some((doc_id, document_offset, document_len)) = self.get_at(i)? {
-                // Reach the end of the data
-                if document_offset == 0 {
+                // Reached uninitialized entries
+                if Self::is_uninitialized_entry(document_offset) {
                     break;
                 }
                 // this document is deleted
-                if document_offset == u32::MAX {
+                if Self::is_deleted(doc_id, document_offset, document_len) {
                     i += 1;
                     continue;
                 }
@@ -216,24 +244,71 @@ impl ZeboPage {
         &self,
         doc_id_with_index: &[(u64, ProbableIndex)],
     ) -> Result<Vec<(DocId, Vec<u8>)>> {
-        let header = self.get_header()?;
-
         let mut r = Vec::with_capacity(doc_id_with_index.len());
-        for (doc_id, _) in doc_id_with_index {
-            let found = header.index.iter().find(|(d, _, _)| d == doc_id);
-            if let Some((_, document_offset, document_len)) = found {
-                let mut doc_buf = vec![0; *document_len as usize];
+
+        for (doc_id, probable_index) in doc_id_with_index {
+            // Try to get data at probable index if it's within bounds
+            let data_at_probable_index = if probable_index.0 < self.document_limit as u64 {
+                match self.get_at(probable_index.0)? {
+                    Some((found_id, document_offset, document_len)) => {
+                        // Check if this entry is a deletion
+                        if Self::is_deleted(found_id, document_offset, document_len)
+                            || Self::is_uninitialized_entry(document_offset)
+                        {
+                            Some((found_id, document_offset, document_len))
+                        } else if found_id == *doc_id {
+                            // Found the document at the probable index location
+                            let mut doc_buf = vec![0; document_len as usize];
+                            // document_len == 0 is an edge but valid case.
+                            // It means that the document is empty.
+                            // In this case, we don't need to read the document from the file
+                            if document_len > 0 {
+                                self.page_file
+                                    .read_exact_at(&mut doc_buf, document_offset as u64)
+                                    .map_err(ZeboError::OperationError)?;
+                            }
+
+                            r.push((DocId::from_u64(*doc_id), doc_buf));
+                            continue;
+                        } else {
+                            Some((found_id, document_offset, document_len))
+                        }
+                    }
+                    None => None,
+                }
+            } else {
+                // ProbableIndex is out of bounds, so no data at probable index
+                None
+            };
+
+            let data_at_probable_index =
+                data_at_probable_index.and_then(|(found_id, document_offset, document_len)| {
+                    if Self::is_uninitialized_entry(document_offset)
+                        || Self::is_deleted(found_id, document_offset, document_len)
+                    {
+                        // Document is uninitialized or deleted (supports both old and new deletion formats). No hint
+                        return None;
+                    }
+                    Some((probable_index.0, (found_id, document_offset, document_len)))
+                });
+
+            // Fallback: use fallback algorithm search if probable index failed or was out of bounds
+            if let Some((_, document_offset, document_len)) =
+                self.fallback_search_document(*doc_id, data_at_probable_index)?
+            {
+                let mut doc_buf = vec![0; document_len as usize];
                 // document_len == 0 is an edge but valid case.
                 // It means that the document is empty.
                 // In this case, we don't need to read the document from the file
-                if document_len > &0 {
+                if document_len > 0 {
                     self.page_file
-                        .read_exact_at(&mut doc_buf, *document_offset as u64)
+                        .read_exact_at(&mut doc_buf, document_offset as u64)
                         .map_err(ZeboError::OperationError)?;
                 }
 
                 r.push((DocId::from_u64(*doc_id), doc_buf));
             }
+            // If it returns None, the document doesn't exist or is deleted
         }
 
         Ok(r)
@@ -335,13 +410,17 @@ impl ZeboPage {
                 Some(x) => x,
                 None => continue,
             };
-            // No data in the header
-            if offset == 0 {
+            // No data in the header - uninitialized entry
+            if Self::is_uninitialized_entry(offset) {
+                continue;
+            }
+            // This document is already deleted
+            if offset == u32::MAX {
                 continue;
             }
             if documents_to_delete.iter().any(|(d, _)| *d == doc_id) {
-                // Erase the document index
-                buf[0..8].copy_from_slice(&u64::MAX.to_be_bytes());
+                // Keep the document ID but mark offset and length as deleted
+                buf[0..8].copy_from_slice(&doc_id.to_be_bytes());
                 buf[8..12].copy_from_slice(&u32::MAX.to_be_bytes());
                 buf[12..16].copy_from_slice(&u32::MAX.to_be_bytes());
                 self.page_file
@@ -375,13 +454,16 @@ impl ZeboPage {
         }
 
         let mut buf = [0; 16];
-
-        self.page_file
-            .read_exact_at(
-                &mut buf,
-                DOCUMENT_INDEX_OFFSET + (document_index * (4 + 4 + 8)),
-            )
-            .map_err(ZeboError::OperationError)?;
+        if let Err(e) = self.page_file.read_exact_at(
+            &mut buf,
+            DOCUMENT_INDEX_OFFSET + (document_index * (4 + 4 + 8)),
+        ) {
+            if e.kind() == std::io::ErrorKind::UnexpectedEof {
+                // Reached the end of the file
+                return Ok(None);
+            }
+            return Err(ZeboError::OperationError(e));
+        }
 
         let doc_id = u64::from_be_bytes([
             buf[0], buf[1], buf[2], buf[3], buf[4], buf[5], buf[6], buf[7],
@@ -391,6 +473,88 @@ impl ZeboPage {
         let document_len = u32::from_be_bytes([buf[12], buf[13], buf[14], buf[15]]);
 
         Ok(Some((doc_id, document_offset, document_len)))
+    }
+
+    fn fallback_search_document(
+        &self,
+        target_doc_id: u64,
+        hint_data: Option<(u64, (u64, u32, u32))>,
+    ) -> Result<Option<(u64, u32, u32)>> {
+        // First check if hint contains the exact document we want
+        let (starting_index, starting_doc_id) = if let Some((index, (doc_id, offset, len))) =
+            hint_data
+        {
+            if doc_id == target_doc_id {
+                if Self::is_uninitialized_entry(offset) || Self::is_deleted(doc_id, offset, len) {
+                    // Found but uninitialized or deleted (supports both old and new deletion formats)
+                    return Ok(None);
+                }
+
+                return Ok(Some((doc_id, offset, len)));
+            }
+
+            (index, doc_id)
+        } else {
+            let document_count = self.get_document_count()?;
+            if document_count == 0 {
+                return Ok(None);
+            }
+            let doc_id = match self.get_at(0)? {
+                None => {
+                    return Ok(None);
+                }
+                Some((doc_id, _, _)) => doc_id,
+            };
+
+            // "No hint found. Starting from 0 index which contains doc_id
+            (0, doc_id)
+        };
+
+        let delta: i32 = if starting_doc_id < target_doc_id {
+            1
+        } else {
+            -1
+        };
+
+        let mut current_index = starting_index;
+        loop {
+            match self.get_at(current_index)? {
+                None => {
+                    // Reached the end of the index without finding the document
+                    return Ok(None);
+                }
+                Some((doc_id, document_offset, document_len)) => {
+                    if doc_id != target_doc_id {
+                        let current_delta = if doc_id < target_doc_id { 1 } else { -1 };
+                        if current_delta != delta {
+                            // We have passed the target document
+                            return Ok(None);
+                        }
+
+                        let temp_current_index = current_index as i128 + current_delta as i128;
+                        if temp_current_index < 0 {
+                            break;
+                        }
+
+                        current_index = temp_current_index as u64;
+
+                        continue;
+                    }
+
+                    if Self::is_uninitialized_entry(document_offset)
+                        || Self::is_deleted(doc_id, document_offset, document_len)
+                    {
+                        // Found but uninitialized or deleted (supports both old and new deletion formats)
+                        return Ok(None);
+                    }
+
+                    return Ok(Some((doc_id, document_offset, document_len)));
+                }
+            }
+        }
+
+        // Document not found
+        Ok(None)
     }
 
     pub fn close(&mut self) -> Result<()> {
@@ -791,10 +955,347 @@ mod tests {
         assert_eq!(
             &file_content[41..89],
             &[
-                255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 0,
-                0, 0, 0, 0, 0, 0, 3, 0, 0, 0, 189, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 4, 0, 0, 0,
-                191, 0, 0, 0, 2
+                0, 0, 0, 0, 0, 0, 0, 2, 255, 255, 255, 255, 255, 255, 255, 255, 0, 0, 0, 0, 0, 0,
+                0, 3, 0, 0, 0, 189, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 4, 0, 0, 0, 191, 0, 0, 0, 2
             ]
         );
+    }
+
+    #[test]
+    fn test_page_get_documents_with_gaps() {
+        let test_dir = prepare_test_dir();
+
+        let file_path = test_dir.join("page_0.zebo");
+        let zebo_page_file = std::fs::File::options()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(&file_path)
+            .unwrap();
+        let mut page = ZeboPage::try_new(10, 0, zebo_page_file).unwrap();
+
+        // Add documents with gaps in IDs: 1, 5, 8, 12 (missing 2, 3, 4, 6, 7, 9, 10, 11, 13, 14, etc.)
+        let reserved1 = page.reserve_space(1, 1).unwrap();
+        reserved1.write(b"a").unwrap();
+
+        let reserved5 = page.reserve_space(5, 1).unwrap();
+        reserved5.write(b"e").unwrap();
+
+        let reserved8 = page.reserve_space(8, 1).unwrap();
+        reserved8.write(b"h").unwrap();
+
+        let reserved12 = page.reserve_space(12, 1).unwrap();
+        reserved12.write(b"l").unwrap();
+
+        // Test 1: Request existing documents only
+        // Note: documents are stored sequentially in slots 0, 1, 2, 3 regardless of their IDs
+        // The ProbableIndex calculation assumes doc_id - starting_document_id, but this may not match actual slot position
+        let existing_docs = vec![
+            (1, ProbableIndex(1)), // Document is actually in slot 0, but ProbableIndex says slot 1
+            (5, ProbableIndex(5)), // Document is actually in slot 1, but ProbableIndex says slot 5 (out of bounds)
+            (8, ProbableIndex(8)), // Document is actually in slot 2, but ProbableIndex says slot 8 (out of bounds)
+            (12, ProbableIndex(12)), // Document is actually in slot 3, but ProbableIndex says slot 12 (out of bounds)
+        ];
+
+        let result = page.get_documents::<u32>(&existing_docs).unwrap();
+        assert_eq!(result.len(), 4);
+
+        // Sort results to ensure consistent testing
+        let mut sorted_result = result;
+        sorted_result.sort_by_key(|(id, _)| *id);
+
+        assert_eq!(sorted_result[0], (1, b"a".to_vec()));
+        assert_eq!(sorted_result[1], (5, b"e".to_vec()));
+        assert_eq!(sorted_result[2], (8, b"h".to_vec()));
+        assert_eq!(sorted_result[3], (12, b"l".to_vec()));
+
+        // Test 2: Request missing documents only
+        let missing_docs = vec![
+            (2, ProbableIndex(2)),
+            (3, ProbableIndex(3)),
+            (4, ProbableIndex(4)),
+            (6, ProbableIndex(6)),
+            (7, ProbableIndex(7)),
+            (9, ProbableIndex(9)),
+            (10, ProbableIndex(10)),
+            (11, ProbableIndex(11)),
+            (13, ProbableIndex(13)), // Out of bounds
+            (14, ProbableIndex(14)), // Out of bounds
+        ];
+
+        let result = page.get_documents::<u32>(&missing_docs).unwrap();
+        assert_eq!(
+            result.len(),
+            0,
+            "Should return no documents for missing IDs"
+        );
+
+        // Test 3: Request mix of existing and missing documents
+        let mixed_docs = vec![
+            (1, ProbableIndex(1)),   // Exists
+            (2, ProbableIndex(2)),   // Missing
+            (5, ProbableIndex(5)),   // Exists
+            (6, ProbableIndex(6)),   // Missing
+            (8, ProbableIndex(8)),   // Exists
+            (9, ProbableIndex(9)),   // Missing
+            (12, ProbableIndex(12)), // Exists, but ProbableIndex out of bounds
+            (15, ProbableIndex(15)), // Missing, ProbableIndex out of bounds
+        ];
+
+        let result = page.get_documents::<u32>(&mixed_docs).unwrap();
+        assert_eq!(result.len(), 4, "Should return only existing documents");
+
+        let mut sorted_result = result;
+        sorted_result.sort_by_key(|(id, _)| *id);
+
+        assert_eq!(sorted_result[0], (1, b"a".to_vec()));
+        assert_eq!(sorted_result[1], (5, b"e".to_vec()));
+        assert_eq!(sorted_result[2], (8, b"h".to_vec()));
+        assert_eq!(sorted_result[3], (12, b"l".to_vec()));
+
+        // Test 4: Request with wrong ProbableIndex values (to test fallback mechanism)
+        let wrong_probable_docs = vec![
+            (1, ProbableIndex(0)), // Wrong probable index (should be 1), should still find via fallback
+            (5, ProbableIndex(2)), // Wrong probable index (should be 5), should still find via fallback
+            (8, ProbableIndex(50)), // Way out of bounds, should find via fallback
+        ];
+
+        let result = page.get_documents::<u32>(&wrong_probable_docs).unwrap();
+        assert_eq!(
+            result.len(),
+            3,
+            "Should find documents even with wrong ProbableIndex"
+        );
+
+        let mut sorted_result = result;
+        sorted_result.sort_by_key(|(id, _)| *id);
+
+        assert_eq!(sorted_result[0], (1, b"a".to_vec()));
+        assert_eq!(sorted_result[1], (5, b"e".to_vec()));
+        assert_eq!(sorted_result[2], (8, b"h".to_vec()));
+
+        // Test 5: Test binary search with deletions
+        // Delete document 5 and verify binary search still works
+        page.delete_documents(&[(5, ProbableIndex(5))], false)
+            .unwrap();
+
+        let after_deletion_docs = vec![
+            (1, ProbableIndex(1)),   // Should still exist
+            (5, ProbableIndex(5)),   // Should be deleted (not returned)
+            (8, ProbableIndex(8)),   // Should still exist
+            (12, ProbableIndex(12)), // Should still exist
+        ];
+
+        let result = page.get_documents::<u32>(&after_deletion_docs).unwrap();
+        assert_eq!(
+            result.len(),
+            3,
+            "Should return 3 documents after deleting one"
+        );
+
+        let mut sorted_result = result;
+        sorted_result.sort_by_key(|(id, _)| *id);
+
+        assert_eq!(sorted_result[0], (1, b"a".to_vec()));
+        assert_eq!(sorted_result[1], (8, b"h".to_vec()));
+        assert_eq!(sorted_result[2], (12, b"l".to_vec()));
+        // Document 5 should not be in results since it was deleted
+
+        // Test 6: Binary search fallback with mixed scenarios
+        // Request documents that require different search strategies
+        let mixed_search_docs = vec![
+            (1, ProbableIndex(0)),  // Wrong hint, needs binary search
+            (8, ProbableIndex(50)), // Out of bounds hint, needs binary search
+            (12, ProbableIndex(1)), // Wrong hint, needs binary search
+            (5, ProbableIndex(5)),  // Deleted document with correct hint
+            (99, ProbableIndex(2)), // Non-existent document
+        ];
+
+        let result = page.get_documents::<u32>(&mixed_search_docs).unwrap();
+        assert_eq!(
+            result.len(),
+            3,
+            "Should find 3 existing non-deleted documents"
+        );
+
+        let mut sorted_result = result;
+        sorted_result.sort_by_key(|(id, _)| *id);
+
+        assert_eq!(sorted_result[0], (1, b"a".to_vec()));
+        assert_eq!(sorted_result[1], (8, b"h".to_vec()));
+        assert_eq!(sorted_result[2], (12, b"l".to_vec()));
+    }
+
+    #[test]
+    fn test_backwards_compatible_old_deletion_format() {
+        let test_dir = prepare_test_dir();
+
+        let file_path = test_dir.join("page_0.zebo");
+        let zebo_page_file = std::fs::File::options()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(&file_path)
+            .unwrap();
+        let mut page = ZeboPage::try_new(10, 0, zebo_page_file).unwrap();
+
+        // Add some documents
+        let reserved1 = page.reserve_space(1, 1).unwrap();
+        reserved1.write(b"a").unwrap();
+
+        let reserved2 = page.reserve_space(2, 1).unwrap();
+        reserved2.write(b"b").unwrap();
+
+        let reserved3 = page.reserve_space(3, 1).unwrap();
+        reserved3.write(b"c").unwrap();
+
+        // Manually simulate old deletion format by directly writing to the file
+        // Old format: doc_id = u64::MAX, offset = u32::MAX, length = u32::MAX
+        let mut old_deletion_buf = [0u8; 16];
+        old_deletion_buf[0..8].copy_from_slice(&u64::MAX.to_be_bytes()); // doc_id = u64::MAX
+        old_deletion_buf[8..12].copy_from_slice(&u32::MAX.to_be_bytes()); // offset = u32::MAX
+        old_deletion_buf[12..16].copy_from_slice(&u32::MAX.to_be_bytes()); // length = u32::MAX
+
+        // Write old deletion format at slot 1 (where document 2 was)
+        page.page_file
+            .write_all_at(&old_deletion_buf, DOCUMENT_INDEX_OFFSET + 16)
+            .unwrap();
+
+        // Update document count to reflect the deletion
+        let document_count = page.get_document_count().unwrap();
+        page.page_file
+            .write_all_at(&(document_count - 1).to_be_bytes(), DOCUMENT_COUNT_OFFSET)
+            .unwrap();
+
+        // Test that get_header() correctly skips old-style deletions
+        let header = page.get_header().unwrap();
+        assert_eq!(header.document_count, 2);
+        assert_eq!(header.index.len(), 2);
+
+        // Verify only non-deleted documents are in the index
+        let doc_ids: Vec<u64> = header.index.iter().map(|(id, _, _)| *id).collect();
+        assert!(doc_ids.contains(&1));
+        assert!(doc_ids.contains(&3));
+        assert!(!doc_ids.contains(&2));
+        assert!(!doc_ids.contains(&u64::MAX));
+
+        // Test that get_documents() can still retrieve non-deleted documents
+        let result = page
+            .get_documents::<u32>(&[(1, ProbableIndex(0)), (3, ProbableIndex(2))])
+            .unwrap();
+        assert_eq!(result.len(), 2);
+
+        let mut sorted_result = result;
+        sorted_result.sort_by_key(|(id, _)| *id);
+        assert_eq!(sorted_result[0], (1, b"a".to_vec()));
+        assert_eq!(sorted_result[1], (3, b"c".to_vec()));
+
+        // Test that searching for the deleted document returns nothing
+        let deleted_result = page.get_documents::<u32>(&[(2, ProbableIndex(1))]).unwrap();
+        assert_eq!(deleted_result.len(), 0);
+    }
+
+    #[test]
+    fn test_mixed_deletion_formats() {
+        let test_dir = prepare_test_dir();
+
+        let file_path = test_dir.join("page_0.zebo");
+        let zebo_page_file = std::fs::File::options()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(&file_path)
+            .unwrap();
+        let mut page = ZeboPage::try_new(10, 0, zebo_page_file).unwrap();
+
+        // Add documents
+        let reserved1 = page.reserve_space(1, 1).unwrap();
+        reserved1.write(b"a").unwrap();
+
+        let reserved2 = page.reserve_space(2, 1).unwrap();
+        reserved2.write(b"b").unwrap();
+
+        let reserved3 = page.reserve_space(3, 1).unwrap();
+        reserved3.write(b"c").unwrap();
+
+        let reserved4 = page.reserve_space(4, 1).unwrap();
+        reserved4.write(b"d").unwrap();
+
+        // Delete document 2 using old format (manually)
+        // Note: In the old format, document count wasn't always properly maintained
+        let mut old_deletion_buf = [0u8; 16];
+        old_deletion_buf[0..8].copy_from_slice(&u64::MAX.to_be_bytes());
+        old_deletion_buf[8..12].copy_from_slice(&u32::MAX.to_be_bytes());
+        old_deletion_buf[12..16].copy_from_slice(&u32::MAX.to_be_bytes());
+        page.page_file
+            .write_all_at(&old_deletion_buf, DOCUMENT_INDEX_OFFSET + 16)
+            .unwrap();
+
+        // Delete document 4 using new format (via delete_documents)
+        page.delete_documents(&[(4, ProbableIndex(3))], false)
+            .unwrap();
+
+        // Test that get_header() correctly handles both deletion formats
+        let header = page.get_header().unwrap();
+        // The header should correctly identify only 2 non-deleted documents in the index
+        // but the stored document_count might be inconsistent due to mixed deletion formats
+        assert_eq!(header.document_count, 3); // delete_documents decremented by 1 from original 4
+        assert_eq!(header.index.len(), 2);
+
+        // Verify only non-deleted documents are in the index
+        let doc_ids: Vec<u64> = header.index.iter().map(|(id, _, _)| *id).collect();
+        assert!(doc_ids.contains(&1));
+        assert!(doc_ids.contains(&3));
+        assert!(!doc_ids.contains(&2));
+        assert!(!doc_ids.contains(&4));
+
+        // Test document retrieval works for both deletion formats
+        let all_docs = page
+            .get_documents::<u32>(&[
+                (1, ProbableIndex(0)), // Should be found
+                (2, ProbableIndex(1)), // Old deletion format - should not be found
+                (3, ProbableIndex(2)), // Should be found
+                (4, ProbableIndex(3)), // New deletion format - should not be found
+            ])
+            .unwrap();
+
+        assert_eq!(all_docs.len(), 2);
+        let mut sorted_result = all_docs;
+        sorted_result.sort_by_key(|(id, _)| *id);
+        assert_eq!(sorted_result[0], (1, b"a".to_vec()));
+        assert_eq!(sorted_result[1], (3, b"c".to_vec()));
+    }
+
+    #[test]
+    fn test_deletion_detection_helper() {
+        // Test old format deletion detection
+        assert!(ZeboPage::is_deleted(u64::MAX, u32::MAX, u32::MAX));
+        assert!(ZeboPage::is_deleted(u64::MAX, u32::MAX, 0));
+
+        // Test new format deletion detection
+        assert!(ZeboPage::is_deleted(1, u32::MAX, u32::MAX));
+        assert!(ZeboPage::is_deleted(12345, u32::MAX, u32::MAX));
+
+        // Test non-deletion cases
+        assert!(!ZeboPage::is_deleted(1, 100, 50));
+        assert!(!ZeboPage::is_deleted(u64::MAX, 100, 50));
+        assert!(!ZeboPage::is_deleted(1, 0, 0)); // Empty document
+        assert!(!ZeboPage::is_deleted(1, u32::MAX, 50)); // Only offset is MAX
+        assert!(!ZeboPage::is_deleted(1, 100, u32::MAX)); // Only length is MAX
+    }
+
+    #[test]
+    fn test_uninitialized_entry_detection() {
+        // Test uninitialized entry detection
+        assert!(ZeboPage::is_uninitialized_entry(0));
+
+        // Test non-uninitialized cases
+        assert!(!ZeboPage::is_uninitialized_entry(1));
+        assert!(!ZeboPage::is_uninitialized_entry(57)); // Typical starting offset
+        assert!(!ZeboPage::is_uninitialized_entry(100));
+        assert!(!ZeboPage::is_uninitialized_entry(u32::MAX)); // Used for deleted entries
     }
 }

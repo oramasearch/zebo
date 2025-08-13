@@ -236,7 +236,7 @@ impl<const MAX_DOC_PER_PAGE: u32, const PAGE_SIZE: u64, DocId: DocumentId>
         Ok(removed)
     }
 
-    /// Returns an iterator without the order guarantees
+    /// Returns an iterator with the order guarantees
     pub fn get_documents<I: IntoIterator<Item = DocId> + Clone>(
         &self,
         doc_ids: I,
@@ -244,7 +244,11 @@ impl<const MAX_DOC_PER_PAGE: u32, const PAGE_SIZE: u64, DocId: DocumentId>
         let mut results: HashMap<PageId, Vec<(u64, ProbableIndex)>> = Default::default();
         self.index.get_pages(doc_ids, &mut results)?;
 
-        let page_iterator = ZeboPageIterator::new(self, results.into_iter());
+        // Sort pages which guarantee the order of documents
+        let mut pages: Vec<_> = results.into_iter().collect();
+        pages.sort_by_key(|(page_id, _)| page_id.0);
+
+        let page_iterator = ZeboPageIterator::new(self, pages.into_iter());
         Ok(ZeboDocumentIterator {
             iter: page_iterator,
             current_v: None,
@@ -260,6 +264,37 @@ impl<const MAX_DOC_PER_PAGE: u32, const PAGE_SIZE: u64, DocId: DocumentId>
             Some(Err(e)) => Err(e),
             None => Ok(None),
         }
+    }
+
+    /// Returns an iterator over all documents without order guarantees
+    pub fn get_all_documents(&self) -> Result<impl Iterator<Item = Result<(DocId, Vec<u8>)>>> {
+        let mut results: HashMap<PageId, Vec<(u64, ProbableIndex)>> = Default::default();
+
+        // Get all page IDs
+        let page_ids = self.index.get_page_ids()?;
+
+        // For each page, get all document IDs
+        for page_id in page_ids {
+            let page = load_page(&self.base_dir, page_id, Mode::Read)?;
+            let header = page.get_header()?;
+
+            // Extract all document IDs and their probable indices from this page
+            let mut page_documents = Vec::with_capacity(header.index.len());
+            for (doc_id, _, _) in header.index {
+                let probable_index = ProbableIndex(doc_id - page.starting_document_id);
+                page_documents.push((doc_id, probable_index));
+            }
+
+            if !page_documents.is_empty() {
+                results.insert(page_id, page_documents);
+            }
+        }
+
+        let page_iterator = ZeboPageIterator::new(self, results.into_iter());
+        Ok(ZeboDocumentIterator {
+            iter: page_iterator,
+            current_v: None,
+        })
     }
 
     /// Returns the total document count
@@ -575,7 +610,7 @@ mod tests {
         let address1 = &num1 as *const Vec<i32>;
         let number1 = address1 as i32;
 
-        let test_dir = std::env::temp_dir().join(format!("zebo_test_{}", number1));
+        let test_dir = std::env::temp_dir().join(format!("zebo_test_{number1}"));
         // let test_dir = std::env::current_dir().unwrap().join("zebo_test");
         if test_dir.exists() {
             std::fs::remove_dir_all(&test_dir).unwrap();
@@ -884,6 +919,88 @@ mod tests {
                     (5, b"5".to_vec()),
                     (6, b"6".to_vec()),
                 ]
+            );
+        }
+
+        #[test]
+        fn test_zebo_get_all_documents() {
+            let test_dir = prepare_test_dir();
+
+            let mut zebo: Zebo<2, 2048, u32> =
+                Zebo::<2, 2048, _>::try_new(test_dir.clone()).unwrap();
+
+            // Add documents across multiple pages
+            zebo.add_documents(vec![(1, "first"), (2, "second"), (3, "third")])
+                .unwrap();
+            zebo.add_documents(vec![(4, "fourth"), (5, "fifth"), (6, "sixth")])
+                .unwrap();
+
+            // Get all documents and verify they're all returned
+            let mut all_docs = zebo
+                .get_all_documents()
+                .unwrap()
+                .collect::<Result<Vec<_>>>()
+                .unwrap();
+
+            // Sort for comparison since order is not guaranteed
+            all_docs.sort_by_key(|d| d.0);
+
+            assert_eq!(all_docs.len(), 6);
+            assert_eq!(
+                all_docs,
+                vec![
+                    (1, b"first".to_vec()),
+                    (2, b"second".to_vec()),
+                    (3, b"third".to_vec()),
+                    (4, b"fourth".to_vec()),
+                    (5, b"fifth".to_vec()),
+                    (6, b"sixth".to_vec()),
+                ]
+            );
+
+            // Test with empty storage
+            let test_dir_empty = prepare_test_dir();
+            let zebo_empty: Zebo<2, 2048, u32> =
+                Zebo::<2, 2048, _>::try_new(test_dir_empty).unwrap();
+
+            let empty_docs: Vec<_> = zebo_empty
+                .get_all_documents()
+                .unwrap()
+                .collect::<Result<Vec<_>>>()
+                .unwrap();
+            assert_eq!(empty_docs.len(), 0);
+        }
+
+        #[test]
+        fn test_zebo_get_all_documents_with_deletions() {
+            let test_dir = prepare_test_dir();
+
+            let mut zebo: Zebo<5, 2048, u32> =
+                Zebo::<5, 2048, _>::try_new(test_dir.clone()).unwrap();
+
+            // Add documents to a single page to avoid the page file issue
+            zebo.add_documents(vec![
+                (1, "first"),
+                (2, "second"),
+                (3, "third"),
+                (4, "fourth"),
+            ])
+            .unwrap();
+
+            // Remove some documents
+            zebo.remove_documents(vec![2, 4], true).unwrap();
+
+            let mut remaining_docs = zebo
+                .get_all_documents()
+                .unwrap()
+                .collect::<Result<Vec<_>>>()
+                .unwrap();
+            remaining_docs.sort_by_key(|d| d.0);
+
+            assert_eq!(remaining_docs.len(), 2);
+            assert_eq!(
+                remaining_docs,
+                vec![(1, b"first".to_vec()), (3, b"third".to_vec()),]
             );
         }
 

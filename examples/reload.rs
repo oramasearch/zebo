@@ -63,7 +63,7 @@ fn main() {
     .expect("Failed to add documents");
 
     let info = zebo.get_info();
-    println!("Zebo Info: {:#?}", info);
+    println!("Zebo Info: {info:#?}");
 
     drop(zebo);
     let mut zebo = Zebo::<5, PAGE_SIZE, DocumentId>::try_new(data_dir)
@@ -79,5 +79,5 @@ fn main() {
     .expect("Failed to add documents");
 
     let info = zebo.get_info();
-    println!("Zebo Info: {:#?}", info);
+    println!("Zebo Info: {info:#?}");
 }
