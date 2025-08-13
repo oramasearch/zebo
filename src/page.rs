@@ -493,7 +493,34 @@ impl ZeboPage {
                 return Ok(Some((doc_id, offset, len)));
             }
 
-            (index, doc_id)
+            let document_count = self.get_document_count()? as u64;
+
+            let most_probable_index = if doc_id < target_doc_id {
+                (target_doc_id - doc_id + index).min(document_count - 1)
+            } else {
+                (doc_id - target_doc_id + index).min(document_count - 1)
+            };
+
+            match self.get_at(most_probable_index)? {
+                None => {
+                    // No data at the most probable index, so we start from the hint
+                    (index, doc_id)
+                },
+                Some((found_doc_id, document_offset, document_len)) => {
+                    if found_doc_id == target_doc_id {
+                        if Self::is_uninitialized_entry(document_offset)
+                            || Self::is_deleted(found_doc_id, document_offset, document_len)
+                        {
+                            // Found but uninitialized or deleted (supports both old and new deletion formats)
+                            return Ok(None);
+                        }
+
+                        return Ok(Some((found_doc_id, document_offset, document_len)));
+                    }
+
+                    (most_probable_index, found_doc_id)
+                }
+            }
         } else {
             let document_count = self.get_document_count()?;
             if document_count == 0 {
