@@ -1,4 +1,4 @@
-use std::{fmt::Formatter, io::{Read, Write}, os::unix::fs::FileExt};
+use std::{io::Write, os::unix::fs::FileExt};
 
 use crate::{DocumentId, Result, Version, ZeboError, index::ProbableIndex};
 
@@ -476,11 +476,11 @@ impl ZeboPage {
     }
 
     /// Fallback document search algorithm for when probable index lookup fails
-    /// 
+    ///
     /// PERFORMANCE NOTE: This algorithm performs a linear search through the page index,
     /// which can be slow for large pages with many deleted entries. However, this fix
     /// ensures CORRECTNESS by properly handling deleted entries.
-    /// 
+    ///
     /// BUG FIX: Previous implementation would incorrectly terminate the search when
     /// encountering a deleted entry with the target doc_id, even if a valid (non-deleted)
     /// entry with the same doc_id existed elsewhere in the page. This fix ensures we
@@ -490,7 +490,6 @@ impl ZeboPage {
         target_doc_id: u64,
         hint_data: Option<(u64, (u64, u32, u32))>,
     ) -> Result<Option<(u64, u32, u32)>> {
-
         // First check if hint contains the exact document we want
         let (starting_index, starting_doc_id) = if let Some((index, (doc_id, offset, len))) =
             hint_data
@@ -554,7 +553,6 @@ impl ZeboPage {
             -1
         };
 
-
         let mut current_index = starting_index;
         let mut iterations = 0;
         loop {
@@ -583,12 +581,12 @@ impl ZeboPage {
                         current_index = temp_current_index as u64;
                         continue;
                     }
-                    
+
                     // Found a valid (non-deleted) entry - check if it matches our target
                     if doc_id == target_doc_id {
                         return Ok(Some((doc_id, document_offset, document_len)));
                     }
-                    
+
                     // Document ID doesn't match - determine search direction based on comparison
                     let current_delta = if doc_id < target_doc_id { 1 } else { -1 };
                     if current_delta != delta {
@@ -706,40 +704,56 @@ impl ZeboPage {
 
     pub fn debug_content(&self, writer: &mut dyn std::io::Write) -> Result<()> {
         let mut buf = [0; 1];
-        self.page_file.read_exact_at(&mut buf, VERSION_OFFSET).unwrap();
+        self.page_file
+            .read_exact_at(&mut buf, VERSION_OFFSET)
+            .unwrap();
 
         let version = u8::from_be_bytes(buf);
-        writeln!(writer, "Version: {}", version).unwrap();
+        writeln!(writer, "Version: {version}").unwrap();
 
         let mut buf = [0; 4];
-        self.page_file.read_exact_at(&mut buf, DOCUMENT_COUNT_LIMIT_OFFSET).unwrap();
+        self.page_file
+            .read_exact_at(&mut buf, DOCUMENT_COUNT_LIMIT_OFFSET)
+            .unwrap();
 
         let document_limit = u32::from_be_bytes(buf);
-        writeln!(writer, "Document Limit: {}", document_limit).unwrap();
+        writeln!(writer, "Document Limit: {document_limit}").unwrap();
 
         let mut buf = [0; 4];
-        self.page_file.read_exact_at(&mut buf, DOCUMENT_COUNT_OFFSET).unwrap();
+        self.page_file
+            .read_exact_at(&mut buf, DOCUMENT_COUNT_OFFSET)
+            .unwrap();
 
         let document_count = u32::from_be_bytes(buf);
-        writeln!(writer, "Document Count: {}", document_count).unwrap();
+        writeln!(writer, "Document Count: {document_count}").unwrap();
 
         let mut buf = [0; 4];
-        self.page_file.read_exact_at(&mut buf, NEXT_AVAILABLE_OFFSET).unwrap();
+        self.page_file
+            .read_exact_at(&mut buf, NEXT_AVAILABLE_OFFSET)
+            .unwrap();
 
         let next_available_offset = u32::from_be_bytes(buf);
-        writeln!(writer, "Next Available Offset: {}", next_available_offset).unwrap();
+        writeln!(writer, "Next Available Offset: {next_available_offset}").unwrap();
 
         let mut buf = [0; 4];
-        self.page_file.read_exact_at(&mut buf, NEXT_AVAILABLE_HEADER_OFFSET).unwrap();
+        self.page_file
+            .read_exact_at(&mut buf, NEXT_AVAILABLE_HEADER_OFFSET)
+            .unwrap();
 
         let next_available_header_offset = u32::from_be_bytes(buf);
-        writeln!(writer, "Next Available Header Offset: {}", next_available_header_offset).unwrap();
+        writeln!(
+            writer,
+            "Next Available Header Offset: {next_available_header_offset}"
+        )
+        .unwrap();
 
         let mut buf = [0; 8];
-        self.page_file.read_exact_at(&mut buf, DOCUMENT_INDEX_OFFSET).unwrap();
+        self.page_file
+            .read_exact_at(&mut buf, DOCUMENT_INDEX_OFFSET)
+            .unwrap();
 
         let starting_document_id = u64::from_be_bytes(buf);
-        writeln!(writer, "Starting Document ID: {}", starting_document_id).unwrap();
+        writeln!(writer, "Starting Document ID: {starting_document_id}").unwrap();
 
         let mut offset = DOCUMENT_INDEX_OFFSET;
         let mut doc_id = [0; 8];
@@ -751,15 +765,23 @@ impl ZeboPage {
             if doc_id == [0; 8] {
                 break;
             }
-            self.page_file.read_exact_at(&mut starting_offset, offset + 8).unwrap();
-            self.page_file.read_exact_at(&mut bytes_length, offset + 12).unwrap();
+            self.page_file
+                .read_exact_at(&mut starting_offset, offset + 8)
+                .unwrap();
+            self.page_file
+                .read_exact_at(&mut bytes_length, offset + 12)
+                .unwrap();
 
             let doc_id = u64::from_be_bytes(doc_id);
-            
+
             let starting_offset = u32::from_be_bytes(starting_offset);
             let bytes_length = u32::from_be_bytes(bytes_length);
 
-            writeln!(writer, "# Document id: {}, starting_offset: {}, bytes_length: {}", doc_id, starting_offset, bytes_length).unwrap();
+            writeln!(
+                writer,
+                "# Document id: {doc_id}, starting_offset: {starting_offset}, bytes_length: {bytes_length}"
+            )
+            .unwrap();
 
             if bytes_length == u32::MAX || starting_offset == u32::MAX {
                 writeln!(writer, "Document is deleted or uninitialized").unwrap();
@@ -774,20 +796,20 @@ impl ZeboPage {
                     .read_exact_at(slice, starting_offset as u64)
                     .unwrap();
 
-
                 // if ![344583, 344584, 344585].contains(&doc_id) {
-                    let probable_index = ProbableIndex(doc_id - starting_document_id);
-                    let output = self.get_documents::<u64>(&[(doc_id, probable_index)])
-                        .unwrap();
-                    assert_eq!(output.len(), 1);
-                    let (f_doc_id, f_content) = &output[0];
-                    assert_eq!(*f_doc_id, doc_id);
-                    assert_eq!(*f_content, slice);
+                let probable_index = ProbableIndex(doc_id - starting_document_id);
+                let output = self
+                    .get_documents::<u64>(&[(doc_id, probable_index)])
+                    .unwrap();
+                assert_eq!(output.len(), 1);
+                let (f_doc_id, f_content) = &output[0];
+                assert_eq!(*f_doc_id, doc_id);
+                assert_eq!(*f_content, slice);
                 // }
 
                 match String::from_utf8(slice.to_vec()) {
                     Ok(s) => {
-                        writeln!(writer, "{}", s).unwrap();
+                        writeln!(writer, "{s}").unwrap();
                     }
                     Err(_) => {
                         writeln!(writer, "Document content: [binary data]").unwrap();
@@ -1448,5 +1470,70 @@ mod tests {
         assert!(!ZeboPage::is_uninitialized_entry(57)); // Typical starting offset
         assert!(!ZeboPage::is_uninitialized_entry(100));
         assert!(!ZeboPage::is_uninitialized_entry(u32::MAX)); // Used for deleted entries
+    }
+
+    #[test]
+    fn test_fallback_search_bug_with_deleted_target_id() {
+        // This test reproduces the bug in fallback_search_document where it would
+        // incorrectly return "not found" when encountering a deleted entry with the target doc_id
+        // BEFORE finding a valid entry with the same doc_id later in the page.
+        //
+        // BUG: The old implementation checks `doc_id != target_doc_id` BEFORE checking deletion.
+        // When doc_id == target_doc_id, it skips direction logic and goes straight to deletion check.
+        // If the entry is deleted, it returns None immediately instead of continuing the search.
+
+        use crate::tests::prepare_test_dir;
+
+        let test_dir = prepare_test_dir();
+        let file_path = test_dir.join("bug_test_page.zebo");
+        let page_file = std::fs::File::options()
+            .create(true)
+            .truncate(true)
+            .read(true)
+            .write(true)
+            .open(&file_path)
+            .expect("Failed to create page file");
+
+        let mut page = ZeboPage::try_new(10, 100, page_file).expect("Failed to create page");
+
+        // Step 1: Add documents normally
+        let reserved1 = page.reserve_space(101, 2).expect("Failed to reserve");
+        reserved1.write(b"aa").expect("Failed to write");
+
+        let reserved2 = page.reserve_space(102, 2).expect("Failed to reserve");
+        reserved2.write(b"bb").expect("Failed to write");
+
+        let reserved3 = page.reserve_space(105, 2).expect("Failed to reserve");
+        reserved3.write(b"ee").expect("Failed to write");
+
+        // Step 2: Manually corrupt the page by creating a deleted entry with doc_id=105
+        // This simulates the scenario where we have a deleted entry with the same ID
+        // as a valid entry later in the page (shouldn't happen normally, but tests the bug)
+
+        let mut deleted_entry_buf = [0u8; 16];
+        deleted_entry_buf[0..8].copy_from_slice(&105_u64.to_be_bytes()); // target doc_id
+        deleted_entry_buf[8..12].copy_from_slice(&u32::MAX.to_be_bytes()); // deleted marker
+        deleted_entry_buf[12..16].copy_from_slice(&u32::MAX.to_be_bytes()); // deleted marker
+
+        // Overwrite slot 1 (originally doc 102) with this corrupted deleted entry
+        page.page_file
+            .write_all_at(&deleted_entry_buf, DOCUMENT_INDEX_OFFSET + 16)
+            .expect("Failed to write corrupted entry");
+
+        // Step 3: Test fallback search behavior
+        // Use an invalid probable index to force fallback search
+        let result = page
+            .get_documents::<u64>(&[(105, ProbableIndex(999))])
+            .expect("Get documents failed");
+
+        // The bug manifests here:
+        // - Fallback search starts from index 0 (doc_id=101)
+        // - Moves to index 1 (corrupted deleted entry with doc_id=105)
+        // - Since doc_id == target_doc_id, it skips direction check
+        // - Finds entry is deleted and returns None
+        // - Never reaches index 2 where the valid doc_id=105 exists
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].0, 105);
+        assert_eq!(result[0].1, b"ee".to_vec());
     }
 }

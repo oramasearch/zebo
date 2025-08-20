@@ -7,7 +7,11 @@ mod index;
 mod page;
 
 use std::{
-    collections::{HashMap, HashSet}, fmt::Debug, hash::Hash, io::Write, path::{Path, PathBuf}
+    collections::{HashMap, HashSet},
+    fmt::Debug,
+    hash::Hash,
+    io::Write,
+    path::{Path, PathBuf},
 };
 
 pub use error::*;
@@ -1483,28 +1487,6 @@ mod tests {
         assert_eq!(info.page_headers[1].document_count, 2);
         assert_eq!(info.page_headers[2].document_count, 2);
         assert_eq!(info.page_headers[3].document_count, 1);
-    }
-
-    #[test]
-    fn test_real_case() {
-        const PAGE_SIZE: u64 = 1024 * 1024 * 1024;
-        let zebo =
-            Zebo::<1_000_000, PAGE_SIZE, u64>::try_new("./examples/zebo")
-                .expect("Failed to create Zebo instance");
-
-        let output: Vec<_> = zebo
-            .get_documents(vec![344583])
-            .unwrap()
-            .collect::<Result<Vec<_>>>()
-            .unwrap();
-
-        println!("Output: {:?}", output);
-
-
-        assert_eq!(output.len(), 1);
-        assert_eq!(output[0].0, 344583);
-        assert!(output[0].1.len() > 0);
-
     }
 
     struct MyDoc {
