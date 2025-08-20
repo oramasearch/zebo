@@ -314,7 +314,7 @@ impl ZeboPage {
         Ok(r)
     }
 
-    pub fn reserve_space(&mut self, doc_id: u64, len: u32) -> Result<ZeboReservedSpace> {
+    pub fn reserve_space(&mut self, doc_id: u64, len: u32) -> Result<ZeboReservedSpace<'_>> {
         let next_available_offset = self.get_next_available_offset()?;
         let document_count = self.get_document_count()?;
 
@@ -646,7 +646,7 @@ impl ZeboPage {
         &mut self,
         len: usize,
         docs: I,
-    ) -> Result<ZeboMultiReservedSpace> {
+    ) -> Result<ZeboMultiReservedSpace<'_>> {
         // Step 1: Read current state
         let mut next_available_offset = self.get_next_available_offset()?;
         let mut document_count = self.get_document_count()?;
