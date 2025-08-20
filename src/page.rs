@@ -490,10 +490,17 @@ impl ZeboPage {
         target_doc_id: u64,
         hint_data: Option<(u64, (u64, u32, u32))>,
     ) -> Result<Option<(u64, u32, u32)>> {
-        // First check if hint contains the exact document we want
         let (starting_index, starting_doc_id) = if let Some((index, (doc_id, offset, len))) =
             hint_data
         {
+            // With a hint, we can start our search from a more informed position
+            // case 1.
+            //     Hint document ID matches target -> return immediately (if not deleted)
+            // case 2.
+            //     Calculate most probable index based on hint position and ID distance
+            //     If probable index has valid data, use it as starting point
+            //     Otherwise fall back to using the hint index as starting point
+
             if doc_id == target_doc_id {
                 if Self::is_uninitialized_entry(offset) || Self::is_deleted(doc_id, offset, len) {
                     // Found but uninitialized or deleted (supports both old and new deletion formats)
@@ -532,19 +539,40 @@ impl ZeboPage {
                 }
             }
         } else {
+            // Without a hint, we need to decide from where to start searching
+            // case 1.
+            //     No document -> return None
+            // case 2.
+            //     Document count = 1 -> start from initial = 0
+            // case 3.
+            //     Get the last inserted document id
+            //     Compare the distance between the first and last document ids
+            //     Choose the closest one as the starting point
+
             let document_count = self.get_document_count()?;
             if document_count == 0 {
                 return Ok(None);
             }
-            let doc_id = match self.get_at(0)? {
-                None => {
-                    return Ok(None);
-                }
-                Some((doc_id, _, _)) => doc_id,
-            };
 
-            // "No hint found. Starting from 0 index which contains doc_id
-            (0, doc_id)
+            let first_doc_id = self.starting_document_id;
+
+            if document_count == 1 {
+                (0, first_doc_id)
+            } else {
+                let last_index = (document_count - 1) as u64;
+                match self.get_at(last_index)? {
+                    None => (0, first_doc_id),
+                    Some((last_doc_id, _, _)) => {
+                        let distance_from_first = target_doc_id.abs_diff(first_doc_id);
+                        let distance_from_last = target_doc_id.abs_diff(last_doc_id);
+                        if distance_from_last < distance_from_first {
+                            (last_index, last_doc_id)
+                        } else {
+                            (0, first_doc_id)
+                        }
+                    }
+                }
+            }
         };
 
         let delta: i32 = if starting_doc_id < target_doc_id {
@@ -554,12 +582,7 @@ impl ZeboPage {
         };
 
         let mut current_index = starting_index;
-        let mut iterations = 0;
         loop {
-            iterations += 1;
-            if iterations > 1_000_000 {
-                break;
-            }
             match self.get_at(current_index)? {
                 None => {
                     // Reached the end of the index without finding the document
@@ -1535,5 +1558,58 @@ mod tests {
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].0, 105);
         assert_eq!(result[0].1, b"ee".to_vec());
+    }
+
+    #[test]
+    fn test_fallback_search_optimization_start_from_end() {
+        // Test that fallback_search_document optimization chooses the optimal starting point
+        // when target is closer to the end of the page
+        use crate::tests::prepare_test_dir;
+
+        let test_dir = prepare_test_dir();
+        let file_path = test_dir.join("optimization_test_page.zebo");
+        let page_file = std::fs::File::options()
+            .create(true)
+            .truncate(true)
+            .read(true)
+            .write(true)
+            .open(&file_path)
+            .expect("Failed to create page file");
+
+        let mut page = ZeboPage::try_new(10, 1000, page_file).expect("Failed to create page");
+
+        // Add many documents with a large gap in doc_ids
+        // This simulates a scenario where starting from the end is more efficient
+        let doc_ids = vec![100, 200, 300, 400, 500, 600, 700, 800, 900, 950];
+        for doc_id in &doc_ids {
+            let reserved = page.reserve_space(*doc_id, 2).expect("Failed to reserve");
+            reserved.write(b"xx").expect("Failed to write");
+        }
+
+        // Test searching for document near the end (950) - should start from end
+        let result = page
+            .fallback_search_document(950, None)
+            .expect("Search failed");
+        assert!(result.is_some());
+        assert_eq!(result.unwrap().0, 950);
+
+        // Test searching for document near the beginning (100) - should start from beginning
+        let result = page
+            .fallback_search_document(100, None)
+            .expect("Search failed");
+        assert!(result.is_some());
+        assert_eq!(result.unwrap().0, 100);
+
+        // Test searching for non-existent document closer to end (940)
+        let result = page
+            .fallback_search_document(940, None)
+            .expect("Search failed");
+        assert!(result.is_none());
+
+        // Test searching for non-existent document closer to beginning (150)
+        let result = page
+            .fallback_search_document(150, None)
+            .expect("Search failed");
+        assert!(result.is_none());
     }
 }
