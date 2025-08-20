@@ -114,6 +114,7 @@ impl<DocId: DocumentId> ZeboIndex<DocId> {
         let expected_page_size = (self.offset - 8 - 1) / (8 + 8);
 
         let mut pages = Vec::with_capacity(expected_page_size as usize);
+
         for chunk in buf.chunks_exact(16) {
             let page_id = u64::from_be_bytes(chunk[0..8].try_into().unwrap());
             pages.push(PageId(page_id));

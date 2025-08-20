@@ -7,10 +7,7 @@ mod index;
 mod page;
 
 use std::{
-    collections::HashMap,
-    fmt::Debug,
-    hash::Hash,
-    path::{Path, PathBuf},
+    collections::{HashMap, HashSet}, fmt::Debug, hash::Hash, io::Write, path::{Path, PathBuf}
 };
 
 pub use error::*;
@@ -273,6 +270,10 @@ impl<const MAX_DOC_PER_PAGE: u32, const PAGE_SIZE: u64, DocId: DocumentId>
         // Get all page IDs
         let page_ids = self.index.get_page_ids()?;
 
+        let page_ids = page_ids.into_iter().collect::<HashSet<_>>();
+        let mut page_ids: Vec<_> = page_ids.into_iter().collect();
+        page_ids.sort_by_key(|page_id| page_id.0);
+
         // For each page, get all document IDs
         for page_id in page_ids {
             let page = load_page(&self.base_dir, page_id, Mode::Read)?;
@@ -391,6 +392,12 @@ impl<const MAX_DOC_PER_PAGE: u32, const PAGE_SIZE: u64, DocId: DocumentId>
 
         Ok(())
     }
+
+    pub fn debug_content(&self, page_id: u64, formatter: &mut dyn Write) -> Result<()> {
+        let page = load_page(&self.base_dir, PageId(page_id), Mode::Read)?;
+        page.debug_content(formatter)?;
+        Ok(())
+    }
 }
 
 fn load_page(base_dir: &Path, page_id: PageId, mode: Mode) -> Result<ZeboPage> {
@@ -477,6 +484,8 @@ impl<
                     // and iterating over the documents
                     // Anyway, that approach requires lifetimes handling
                     // TODO: use streams
+
+                    println!("Getting docs... {}", d.len());
                     match page.get_documents(&d) {
                         Ok(v) => {
                             self.current_v = Some(v);
@@ -1474,6 +1483,28 @@ mod tests {
         assert_eq!(info.page_headers[1].document_count, 2);
         assert_eq!(info.page_headers[2].document_count, 2);
         assert_eq!(info.page_headers[3].document_count, 1);
+    }
+
+    #[test]
+    fn test_real_case() {
+        const PAGE_SIZE: u64 = 1024 * 1024 * 1024;
+        let zebo =
+            Zebo::<1_000_000, PAGE_SIZE, u64>::try_new("./examples/zebo")
+                .expect("Failed to create Zebo instance");
+
+        let output: Vec<_> = zebo
+            .get_documents(vec![344583])
+            .unwrap()
+            .collect::<Result<Vec<_>>>()
+            .unwrap();
+
+        println!("Output: {:?}", output);
+
+
+        assert_eq!(output.len(), 1);
+        assert_eq!(output[0].0, 344583);
+        assert!(output[0].1.len() > 0);
+
     }
 
     struct MyDoc {

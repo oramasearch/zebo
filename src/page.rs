@@ -1,4 +1,4 @@
-use std::{io::Write, os::unix::fs::FileExt};
+use std::{fmt::Formatter, io::{Read, Write}, os::unix::fs::FileExt};
 
 use crate::{DocumentId, Result, Version, ZeboError, index::ProbableIndex};
 
@@ -247,10 +247,13 @@ impl ZeboPage {
         let mut r = Vec::with_capacity(doc_id_with_index.len());
 
         for (doc_id, probable_index) in doc_id_with_index {
+            println!("Looking for doc_id {} with probable_index {}", doc_id, probable_index.0);
             // Try to get data at probable index if it's within bounds
             let data_at_probable_index = if probable_index.0 < self.document_limit as u64 {
+                println!("Probable index {} is within bounds, document_limit is {}", probable_index.0, self.document_limit);
                 match self.get_at(probable_index.0)? {
                     Some((found_id, document_offset, document_len)) => {
+                        println!("Found at probable index: doc_id={}, offset={}, len={}", found_id, document_offset, document_len);
                         // Check if this entry is a deletion
                         if Self::is_deleted(found_id, document_offset, document_len)
                             || Self::is_uninitialized_entry(document_offset)
@@ -274,7 +277,10 @@ impl ZeboPage {
                             Some((found_id, document_offset, document_len))
                         }
                     }
-                    None => None,
+                    None => {
+                        println!("No data found at probable index {}", probable_index.0);
+                        None
+                    }
                 }
             } else {
                 // ProbableIndex is out of bounds, so no data at probable index
@@ -293,6 +299,7 @@ impl ZeboPage {
                 });
 
             // Fallback: use fallback algorithm search if probable index failed or was out of bounds
+            println!("Calling fallback_search_document with hint: {:?}", data_at_probable_index);
             if let Some((_, document_offset, document_len)) =
                 self.fallback_search_document(*doc_id, data_at_probable_index)?
             {
@@ -480,6 +487,8 @@ impl ZeboPage {
         target_doc_id: u64,
         hint_data: Option<(u64, (u64, u32, u32))>,
     ) -> Result<Option<(u64, u32, u32)>> {
+        println!("Fallback logic for {}", target_doc_id);
+
         // First check if hint contains the exact document we want
         let (starting_index, starting_doc_id) = if let Some((index, (doc_id, offset, len))) =
             hint_data
@@ -498,7 +507,7 @@ impl ZeboPage {
             let most_probable_index = if doc_id < target_doc_id {
                 (target_doc_id - doc_id + index).min(document_count - 1)
             } else {
-                (doc_id - target_doc_id + index).min(document_count - 1)
+                index.saturating_sub(doc_id - target_doc_id)
             };
 
             match self.get_at(most_probable_index)? {
@@ -523,6 +532,7 @@ impl ZeboPage {
             }
         } else {
             let document_count = self.get_document_count()?;
+            println!("No hint, document_count: {}", document_count);
             if document_count == 0 {
                 return Ok(None);
             }
@@ -530,7 +540,10 @@ impl ZeboPage {
                 None => {
                     return Ok(None);
                 }
-                Some((doc_id, _, _)) => doc_id,
+                Some((doc_id, _, _)) => {
+                    println!("Starting from index 0 with doc_id: {}", doc_id);
+                    doc_id
+                }
             };
 
             // "No hint found. Starting from 0 index which contains doc_id
@@ -543,39 +556,58 @@ impl ZeboPage {
             -1
         };
 
+        println!("starting_index: {}", starting_index);
+
         let mut current_index = starting_index;
+        let mut iterations = 0;
         loop {
+            iterations += 1;
+            if iterations > 1_000_000 {
+                println!("Breaking after 1000 iterations to avoid infinite loop");
+                break;
+            }
+            println!("Iteration {}: checking index {}", iterations, current_index);
             match self.get_at(current_index)? {
                 None => {
                     // Reached the end of the index without finding the document
+                    println!("No data at index {}, ending search", current_index);
                     return Ok(None);
                 }
                 Some((doc_id, document_offset, document_len)) => {
-                    if doc_id != target_doc_id {
-                        let current_delta = if doc_id < target_doc_id { 1 } else { -1 };
-                        if current_delta != delta {
-                            // We have passed the target document
-                            return Ok(None);
-                        }
-
-                        let temp_current_index = current_index as i128 + current_delta as i128;
-                        if temp_current_index < 0 {
-                            break;
-                        }
-
-                        current_index = temp_current_index as u64;
-
-                        continue;
-                    }
-
+                    println!("At index {}: found doc_id={}, offset={}, len={}", current_index, doc_id, document_offset, document_len);
+                    
+                    // Check if this entry is deleted/uninitialized first
                     if Self::is_uninitialized_entry(document_offset)
                         || Self::is_deleted(doc_id, document_offset, document_len)
                     {
-                        // Found but uninitialized or deleted (supports both old and new deletion formats)
+                        println!("Entry at index {} is deleted/uninitialized, continuing to next", current_index);
+                        // Skip deleted/uninitialized entries - just increment index and continue
+                        let temp_current_index = current_index as i128 + delta as i128;
+                        if temp_current_index < 0 {
+                            break;
+                        }
+                        current_index = temp_current_index as u64;
+                        continue;
+                    }
+                    
+                    if doc_id == target_doc_id {
+                        return Ok(Some((doc_id, document_offset, document_len)));
+                    }
+                    
+                    // Document ID doesn't match, check direction
+                    let current_delta = if doc_id < target_doc_id { 1 } else { -1 };
+                    if current_delta != delta {
+                        // We have passed the target document
+                        println!("Passed target: doc_id {} with delta {} != expected delta {}", doc_id, current_delta, delta);
                         return Ok(None);
                     }
 
-                    return Ok(Some((doc_id, document_offset, document_len)));
+                    let temp_current_index = current_index as i128 + current_delta as i128;
+                    if temp_current_index < 0 {
+                        break;
+                    }
+
+                    current_index = temp_current_index as u64;
                 }
             }
         }
@@ -675,6 +707,103 @@ impl ZeboPage {
             len: total_len,
             document_offset: initial_next_available_offset,
         })
+    }
+
+    pub fn debug_content(&self, writer: &mut dyn std::io::Write) -> Result<()> {
+        let mut buf = [0; 1];
+        self.page_file.read_exact_at(&mut buf, VERSION_OFFSET).unwrap();
+
+        let version = u8::from_be_bytes(buf);
+        writeln!(writer, "Version: {}", version).unwrap();
+
+        let mut buf = [0; 4];
+        self.page_file.read_exact_at(&mut buf, DOCUMENT_COUNT_LIMIT_OFFSET).unwrap();
+
+        let document_limit = u32::from_be_bytes(buf);
+        writeln!(writer, "Document Limit: {}", document_limit).unwrap();
+
+        let mut buf = [0; 4];
+        self.page_file.read_exact_at(&mut buf, DOCUMENT_COUNT_OFFSET).unwrap();
+
+        let document_count = u32::from_be_bytes(buf);
+        writeln!(writer, "Document Count: {}", document_count).unwrap();
+
+        let mut buf = [0; 4];
+        self.page_file.read_exact_at(&mut buf, NEXT_AVAILABLE_OFFSET).unwrap();
+
+        let next_available_offset = u32::from_be_bytes(buf);
+        writeln!(writer, "Next Available Offset: {}", next_available_offset).unwrap();
+
+        let mut buf = [0; 4];
+        self.page_file.read_exact_at(&mut buf, NEXT_AVAILABLE_HEADER_OFFSET).unwrap();
+
+        let next_available_header_offset = u32::from_be_bytes(buf);
+        writeln!(writer, "Next Available Header Offset: {}", next_available_header_offset).unwrap();
+
+        let mut buf = [0; 8];
+        self.page_file.read_exact_at(&mut buf, DOCUMENT_INDEX_OFFSET).unwrap();
+
+        let starting_document_id = u64::from_be_bytes(buf);
+        writeln!(writer, "Starting Document ID: {}", starting_document_id).unwrap();
+
+        let mut offset = DOCUMENT_INDEX_OFFSET;
+        let mut doc_id = [0; 8];
+        let mut starting_offset = [0; 4];
+        let mut bytes_length = [0; 4];
+        let mut docs: Vec<u8> = vec![];
+        loop {
+            self.page_file.read_exact_at(&mut doc_id, offset).unwrap();
+            if doc_id == [0; 8] {
+                break;
+            }
+            self.page_file.read_exact_at(&mut starting_offset, offset + 8).unwrap();
+            self.page_file.read_exact_at(&mut bytes_length, offset + 12).unwrap();
+
+            let doc_id = u64::from_be_bytes(doc_id);
+            
+            let starting_offset = u32::from_be_bytes(starting_offset);
+            let bytes_length = u32::from_be_bytes(bytes_length);
+
+            writeln!(writer, "# Document id: {}, starting_offset: {}, bytes_length: {}", doc_id, starting_offset, bytes_length).unwrap();
+
+            if bytes_length == u32::MAX || starting_offset == u32::MAX {
+                writeln!(writer, "Document is deleted or uninitialized").unwrap();
+            } else {
+                if docs.len() < bytes_length as usize {
+                    docs.resize(bytes_length as usize, 0);
+                }
+
+                let slice = &mut docs[0..bytes_length as usize];
+
+                self.page_file
+                    .read_exact_at(slice, starting_offset as u64)
+                    .unwrap();
+
+
+                // if ![344583, 344584, 344585].contains(&doc_id) {
+                    let probable_index = ProbableIndex(doc_id - starting_document_id);
+                    let output = self.get_documents::<u64>(&[(doc_id, probable_index)])
+                        .unwrap();
+                    assert_eq!(output.len(), 1);
+                    let (f_doc_id, f_content) = &output[0];
+                    assert_eq!(*f_doc_id, doc_id);
+                    assert_eq!(*f_content, slice);
+                // }
+
+                match String::from_utf8(slice.to_vec()) {
+                    Ok(s) => {
+                        writeln!(writer, "{}", s).unwrap();
+                    }
+                    Err(_) => {
+                        writeln!(writer, "Document content: [binary data]").unwrap();
+                    }
+                }
+            }
+
+            offset += 8 + 4 + 4;
+        }
+
+        Ok(())
     }
 }
 
