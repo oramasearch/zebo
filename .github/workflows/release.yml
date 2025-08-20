@@ -30,10 +30,11 @@ jobs:
             target: aarch64-apple-darwin
             binary_name: zebo-inspect
             asset_name: zebo-inspect-macos-arm64
-          - os: windows-latest
-            target: x86_64-pc-windows-msvc
-            binary_name: zebo-inspect.exe
-            asset_name: zebo-inspect-windows-x64.exe
+          # Windows is not supported yet. Make a PR if interested.
+          # - os: windows-latest
+          #   target: x86_64-pc-windows-msvc
+          #   binary_name: zebo-inspect.exe
+          #   asset_name: zebo-inspect-windows-x64.exe
 
     steps:
     - name: Checkout code
