@@ -314,7 +314,7 @@ impl ZeboPage {
         Ok(r)
     }
 
-    pub fn reserve_space(&mut self, doc_id: u64, len: u32) -> Result<ZeboReservedSpace> {
+    pub fn reserve_space(&mut self, doc_id: u64, len: u32) -> Result<ZeboReservedSpace<'_>> {
         let next_available_offset = self.get_next_available_offset()?;
         let document_count = self.get_document_count()?;
 
@@ -475,15 +475,32 @@ impl ZeboPage {
         Ok(Some((doc_id, document_offset, document_len)))
     }
 
+    /// Fallback document search algorithm for when probable index lookup fails
+    ///
+    /// PERFORMANCE NOTE: This algorithm performs a linear search through the page index,
+    /// which can be slow for large pages with many deleted entries. However, this fix
+    /// ensures CORRECTNESS by properly handling deleted entries.
+    ///
+    /// BUG FIX: Previous implementation would incorrectly terminate the search when
+    /// encountering a deleted entry with the target doc_id, even if a valid (non-deleted)
+    /// entry with the same doc_id existed elsewhere in the page. This fix ensures we
+    /// skip over deleted entries and continue searching until we find the actual document.
     fn fallback_search_document(
         &self,
         target_doc_id: u64,
         hint_data: Option<(u64, (u64, u32, u32))>,
     ) -> Result<Option<(u64, u32, u32)>> {
-        // First check if hint contains the exact document we want
         let (starting_index, starting_doc_id) = if let Some((index, (doc_id, offset, len))) =
             hint_data
         {
+            // With a hint, we can start our search from a more informed position
+            // case 1.
+            //     Hint document ID matches target -> return immediately (if not deleted)
+            // case 2.
+            //     Calculate most probable index based on hint position and ID distance
+            //     If probable index has valid data, use it as starting point
+            //     Otherwise fall back to using the hint index as starting point
+
             if doc_id == target_doc_id {
                 if Self::is_uninitialized_entry(offset) || Self::is_deleted(doc_id, offset, len) {
                     // Found but uninitialized or deleted (supports both old and new deletion formats)
@@ -498,7 +515,7 @@ impl ZeboPage {
             let most_probable_index = if doc_id < target_doc_id {
                 (target_doc_id - doc_id + index).min(document_count - 1)
             } else {
-                (doc_id - target_doc_id + index).min(document_count - 1)
+                index.saturating_sub(doc_id - target_doc_id)
             };
 
             match self.get_at(most_probable_index)? {
@@ -522,19 +539,40 @@ impl ZeboPage {
                 }
             }
         } else {
+            // Without a hint, we need to decide from where to start searching
+            // case 1.
+            //     No document -> return None
+            // case 2.
+            //     Document count = 1 -> start from initial = 0
+            // case 3.
+            //     Get the last inserted document id
+            //     Compare the distance between the first and last document ids
+            //     Choose the closest one as the starting point
+
             let document_count = self.get_document_count()?;
             if document_count == 0 {
                 return Ok(None);
             }
-            let doc_id = match self.get_at(0)? {
-                None => {
-                    return Ok(None);
-                }
-                Some((doc_id, _, _)) => doc_id,
-            };
 
-            // "No hint found. Starting from 0 index which contains doc_id
-            (0, doc_id)
+            let first_doc_id = self.starting_document_id;
+
+            if document_count == 1 {
+                (0, first_doc_id)
+            } else {
+                let last_index = (document_count - 1) as u64;
+                match self.get_at(last_index)? {
+                    None => (0, first_doc_id),
+                    Some((last_doc_id, _, _)) => {
+                        let distance_from_first = target_doc_id.abs_diff(first_doc_id);
+                        let distance_from_last = target_doc_id.abs_diff(last_doc_id);
+                        if distance_from_last < distance_from_first {
+                            (last_index, last_doc_id)
+                        } else {
+                            (0, first_doc_id)
+                        }
+                    }
+                }
+            }
         };
 
         let delta: i32 = if starting_doc_id < target_doc_id {
@@ -551,31 +589,41 @@ impl ZeboPage {
                     return Ok(None);
                 }
                 Some((doc_id, document_offset, document_len)) => {
-                    if doc_id != target_doc_id {
-                        let current_delta = if doc_id < target_doc_id { 1 } else { -1 };
-                        if current_delta != delta {
-                            // We have passed the target document
-                            return Ok(None);
-                        }
-
-                        let temp_current_index = current_index as i128 + current_delta as i128;
-                        if temp_current_index < 0 {
-                            break;
-                        }
-
-                        current_index = temp_current_index as u64;
-
-                        continue;
-                    }
-
+                    // CRITICAL FIX: Check if this entry is deleted/uninitialized BEFORE checking doc_id
+                    // This prevents the algorithm from incorrectly stopping when it encounters
+                    // a deleted entry that happens to have the target doc_id
                     if Self::is_uninitialized_entry(document_offset)
                         || Self::is_deleted(doc_id, document_offset, document_len)
                     {
-                        // Found but uninitialized or deleted (supports both old and new deletion formats)
+                        // Skip deleted/uninitialized entries and continue searching
+                        // We don't change direction here - just move to the next index
+                        let temp_current_index = current_index as i128 + delta as i128;
+                        if temp_current_index < 0 {
+                            break;
+                        }
+                        current_index = temp_current_index as u64;
+                        continue;
+                    }
+
+                    // Found a valid (non-deleted) entry - check if it matches our target
+                    if doc_id == target_doc_id {
+                        return Ok(Some((doc_id, document_offset, document_len)));
+                    }
+
+                    // Document ID doesn't match - determine search direction based on comparison
+                    let current_delta = if doc_id < target_doc_id { 1 } else { -1 };
+                    if current_delta != delta {
+                        // We have passed the target document in the sorted order
+                        // This means the target doesn't exist in this page
                         return Ok(None);
                     }
 
-                    return Ok(Some((doc_id, document_offset, document_len)));
+                    let temp_current_index = current_index as i128 + current_delta as i128;
+                    if temp_current_index < 0 {
+                        break;
+                    }
+
+                    current_index = temp_current_index as u64;
                 }
             }
         }
@@ -598,7 +646,7 @@ impl ZeboPage {
         &mut self,
         len: usize,
         docs: I,
-    ) -> Result<ZeboMultiReservedSpace> {
+    ) -> Result<ZeboMultiReservedSpace<'_>> {
         // Step 1: Read current state
         let mut next_available_offset = self.get_next_available_offset()?;
         let mut document_count = self.get_document_count()?;
@@ -675,6 +723,144 @@ impl ZeboPage {
             len: total_len,
             document_offset: initial_next_available_offset,
         })
+    }
+
+    pub fn debug_content_with_options(
+        &self,
+        writer: &mut dyn std::io::Write,
+        skip_content_checks: bool,
+        skip_document_content: bool,
+        skip_header_info: bool,
+    ) -> Result<()> {
+        let mut buf = [0; 1];
+        self.page_file
+            .read_exact_at(&mut buf, VERSION_OFFSET)
+            .unwrap();
+
+        let version = u8::from_be_bytes(buf);
+        writeln!(writer, "Version: {version}").unwrap();
+
+        let mut buf = [0; 4];
+        self.page_file
+            .read_exact_at(&mut buf, DOCUMENT_COUNT_LIMIT_OFFSET)
+            .unwrap();
+
+        let document_limit = u32::from_be_bytes(buf);
+        writeln!(writer, "Document Limit: {document_limit}").unwrap();
+
+        let mut buf = [0; 4];
+        self.page_file
+            .read_exact_at(&mut buf, DOCUMENT_COUNT_OFFSET)
+            .unwrap();
+
+        let document_count = u32::from_be_bytes(buf);
+        writeln!(writer, "Document Count: {document_count}").unwrap();
+
+        let mut buf = [0; 4];
+        self.page_file
+            .read_exact_at(&mut buf, NEXT_AVAILABLE_OFFSET)
+            .unwrap();
+
+        let next_available_offset = u32::from_be_bytes(buf);
+        writeln!(writer, "Next Available Offset: {next_available_offset}").unwrap();
+
+        let mut buf = [0; 4];
+        self.page_file
+            .read_exact_at(&mut buf, NEXT_AVAILABLE_HEADER_OFFSET)
+            .unwrap();
+
+        let next_available_header_offset = u32::from_be_bytes(buf);
+        writeln!(
+            writer,
+            "Next Available Header Offset: {next_available_header_offset}"
+        )
+        .unwrap();
+
+        let mut buf = [0; 8];
+        self.page_file
+            .read_exact_at(&mut buf, DOCUMENT_INDEX_OFFSET)
+            .unwrap();
+
+        let starting_document_id = u64::from_be_bytes(buf);
+        writeln!(writer, "Starting Document ID: {starting_document_id}").unwrap();
+
+        let mut offset = DOCUMENT_INDEX_OFFSET;
+        let mut doc_id = [0; 8];
+        let mut starting_offset = [0; 4];
+        let mut bytes_length = [0; 4];
+        let mut docs: Vec<u8> = vec![];
+        loop {
+            self.page_file.read_exact_at(&mut doc_id, offset).unwrap();
+            if doc_id == [0; 8] {
+                break;
+            }
+            self.page_file
+                .read_exact_at(&mut starting_offset, offset + 8)
+                .unwrap();
+            self.page_file
+                .read_exact_at(&mut bytes_length, offset + 12)
+                .unwrap();
+
+            let doc_id = u64::from_be_bytes(doc_id);
+
+            let starting_offset = u32::from_be_bytes(starting_offset);
+            let bytes_length = u32::from_be_bytes(bytes_length);
+
+            if !skip_header_info {
+                writeln!(
+                    writer,
+                    "# Document id: {doc_id}, starting_offset: {starting_offset}, bytes_length: {bytes_length}"
+                )
+                .unwrap();
+            }
+
+            if bytes_length == u32::MAX || starting_offset == u32::MAX {
+                if !skip_document_content {
+                    writeln!(writer, "Document is deleted or uninitialized").unwrap();
+                }
+            } else {
+                if docs.len() < bytes_length as usize {
+                    docs.resize(bytes_length as usize, 0);
+                }
+
+                let slice = &mut docs[0..bytes_length as usize];
+
+                self.page_file
+                    .read_exact_at(slice, starting_offset as u64)
+                    .unwrap();
+
+                if !skip_content_checks {
+                    let probable_index = ProbableIndex(doc_id - starting_document_id);
+                    let output = self
+                        .get_documents::<u64>(&[(doc_id, probable_index)])
+                        .unwrap();
+                    assert_eq!(output.len(), 1);
+                    let (f_doc_id, f_content) = &output[0];
+                    assert_eq!(*f_doc_id, doc_id);
+                    assert_eq!(*f_content, slice);
+                }
+
+                if !skip_document_content {
+                    match String::from_utf8(slice.to_vec()) {
+                        Ok(s) => {
+                            writeln!(writer, "{s}").unwrap();
+                        }
+                        Err(_) => {
+                            writeln!(
+                                writer,
+                                "Document content: [binary data of {} bytes]",
+                                slice.len()
+                            )
+                            .unwrap();
+                        }
+                    }
+                }
+            }
+
+            offset += 8 + 4 + 4;
+        }
+
+        Ok(())
     }
 }
 
@@ -1324,5 +1510,123 @@ mod tests {
         assert!(!ZeboPage::is_uninitialized_entry(57)); // Typical starting offset
         assert!(!ZeboPage::is_uninitialized_entry(100));
         assert!(!ZeboPage::is_uninitialized_entry(u32::MAX)); // Used for deleted entries
+    }
+
+    #[test]
+    fn test_fallback_search_bug_with_deleted_target_id() {
+        // This test reproduces the bug in fallback_search_document where it would
+        // incorrectly return "not found" when encountering a deleted entry with the target doc_id
+        // BEFORE finding a valid entry with the same doc_id later in the page.
+        //
+        // BUG: The old implementation checks `doc_id != target_doc_id` BEFORE checking deletion.
+        // When doc_id == target_doc_id, it skips direction logic and goes straight to deletion check.
+        // If the entry is deleted, it returns None immediately instead of continuing the search.
+
+        use crate::tests::prepare_test_dir;
+
+        let test_dir = prepare_test_dir();
+        let file_path = test_dir.join("bug_test_page.zebo");
+        let page_file = std::fs::File::options()
+            .create(true)
+            .truncate(true)
+            .read(true)
+            .write(true)
+            .open(&file_path)
+            .expect("Failed to create page file");
+
+        let mut page = ZeboPage::try_new(10, 100, page_file).expect("Failed to create page");
+
+        // Step 1: Add documents normally
+        let reserved1 = page.reserve_space(101, 2).expect("Failed to reserve");
+        reserved1.write(b"aa").expect("Failed to write");
+
+        let reserved2 = page.reserve_space(102, 2).expect("Failed to reserve");
+        reserved2.write(b"bb").expect("Failed to write");
+
+        let reserved3 = page.reserve_space(105, 2).expect("Failed to reserve");
+        reserved3.write(b"ee").expect("Failed to write");
+
+        // Step 2: Manually corrupt the page by creating a deleted entry with doc_id=105
+        // This simulates the scenario where we have a deleted entry with the same ID
+        // as a valid entry later in the page (shouldn't happen normally, but tests the bug)
+
+        let mut deleted_entry_buf = [0u8; 16];
+        deleted_entry_buf[0..8].copy_from_slice(&105_u64.to_be_bytes()); // target doc_id
+        deleted_entry_buf[8..12].copy_from_slice(&u32::MAX.to_be_bytes()); // deleted marker
+        deleted_entry_buf[12..16].copy_from_slice(&u32::MAX.to_be_bytes()); // deleted marker
+
+        // Overwrite slot 1 (originally doc 102) with this corrupted deleted entry
+        page.page_file
+            .write_all_at(&deleted_entry_buf, DOCUMENT_INDEX_OFFSET + 16)
+            .expect("Failed to write corrupted entry");
+
+        // Step 3: Test fallback search behavior
+        // Use an invalid probable index to force fallback search
+        let result = page
+            .get_documents::<u64>(&[(105, ProbableIndex(999))])
+            .expect("Get documents failed");
+
+        // The bug manifests here:
+        // - Fallback search starts from index 0 (doc_id=101)
+        // - Moves to index 1 (corrupted deleted entry with doc_id=105)
+        // - Since doc_id == target_doc_id, it skips direction check
+        // - Finds entry is deleted and returns None
+        // - Never reaches index 2 where the valid doc_id=105 exists
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].0, 105);
+        assert_eq!(result[0].1, b"ee".to_vec());
+    }
+
+    #[test]
+    fn test_fallback_search_optimization_start_from_end() {
+        // Test that fallback_search_document optimization chooses the optimal starting point
+        // when target is closer to the end of the page
+        use crate::tests::prepare_test_dir;
+
+        let test_dir = prepare_test_dir();
+        let file_path = test_dir.join("optimization_test_page.zebo");
+        let page_file = std::fs::File::options()
+            .create(true)
+            .truncate(true)
+            .read(true)
+            .write(true)
+            .open(&file_path)
+            .expect("Failed to create page file");
+
+        let mut page = ZeboPage::try_new(10, 1000, page_file).expect("Failed to create page");
+
+        // Add many documents with a large gap in doc_ids
+        // This simulates a scenario where starting from the end is more efficient
+        let doc_ids = vec![100, 200, 300, 400, 500, 600, 700, 800, 900, 950];
+        for doc_id in &doc_ids {
+            let reserved = page.reserve_space(*doc_id, 2).expect("Failed to reserve");
+            reserved.write(b"xx").expect("Failed to write");
+        }
+
+        // Test searching for document near the end (950) - should start from end
+        let result = page
+            .fallback_search_document(950, None)
+            .expect("Search failed");
+        assert!(result.is_some());
+        assert_eq!(result.unwrap().0, 950);
+
+        // Test searching for document near the beginning (100) - should start from beginning
+        let result = page
+            .fallback_search_document(100, None)
+            .expect("Search failed");
+        assert!(result.is_some());
+        assert_eq!(result.unwrap().0, 100);
+
+        // Test searching for non-existent document closer to end (940)
+        let result = page
+            .fallback_search_document(940, None)
+            .expect("Search failed");
+        assert!(result.is_none());
+
+        // Test searching for non-existent document closer to beginning (150)
+        let result = page
+            .fallback_search_document(150, None)
+            .expect("Search failed");
+        assert!(result.is_none());
     }
 }

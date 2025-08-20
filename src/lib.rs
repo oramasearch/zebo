@@ -7,9 +7,10 @@ mod index;
 mod page;
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     fmt::Debug,
     hash::Hash,
+    io::Write,
     path::{Path, PathBuf},
 };
 
@@ -273,6 +274,10 @@ impl<const MAX_DOC_PER_PAGE: u32, const PAGE_SIZE: u64, DocId: DocumentId>
         // Get all page IDs
         let page_ids = self.index.get_page_ids()?;
 
+        let page_ids = page_ids.into_iter().collect::<HashSet<_>>();
+        let mut page_ids: Vec<_> = page_ids.into_iter().collect();
+        page_ids.sort_by_key(|page_id| page_id.0);
+
         // For each page, get all document IDs
         for page_id in page_ids {
             let page = load_page(&self.base_dir, page_id, Mode::Read)?;
@@ -391,6 +396,24 @@ impl<const MAX_DOC_PER_PAGE: u32, const PAGE_SIZE: u64, DocId: DocumentId>
 
         Ok(())
     }
+
+    pub fn debug_content_with_options(
+        &self,
+        page_id: u64,
+        formatter: &mut dyn Write,
+        skip_content_checks: bool,
+        skip_document_content: bool,
+        skip_header_info: bool,
+    ) -> Result<()> {
+        let page = load_page(&self.base_dir, PageId(page_id), Mode::Read)?;
+        page.debug_content_with_options(
+            formatter,
+            skip_content_checks,
+            skip_document_content,
+            skip_header_info,
+        )?;
+        Ok(())
+    }
 }
 
 fn load_page(base_dir: &Path, page_id: PageId, mode: Mode) -> Result<ZeboPage> {
@@ -477,6 +500,8 @@ impl<
                     // and iterating over the documents
                     // Anyway, that approach requires lifetimes handling
                     // TODO: use streams
+
+                    println!("Getting docs... {}", d.len());
                     match page.get_documents(&d) {
                         Ok(v) => {
                             self.current_v = Some(v);
