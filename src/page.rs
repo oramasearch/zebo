@@ -725,7 +725,13 @@ impl ZeboPage {
         })
     }
 
-    pub fn debug_content(&self, writer: &mut dyn std::io::Write) -> Result<()> {
+    pub fn debug_content_with_options(
+        &self,
+        writer: &mut dyn std::io::Write,
+        skip_content_checks: bool,
+        skip_document_content: bool,
+        skip_header_info: bool,
+    ) -> Result<()> {
         let mut buf = [0; 1];
         self.page_file
             .read_exact_at(&mut buf, VERSION_OFFSET)
@@ -800,14 +806,18 @@ impl ZeboPage {
             let starting_offset = u32::from_be_bytes(starting_offset);
             let bytes_length = u32::from_be_bytes(bytes_length);
 
-            writeln!(
-                writer,
-                "# Document id: {doc_id}, starting_offset: {starting_offset}, bytes_length: {bytes_length}"
-            )
-            .unwrap();
+            if !skip_header_info {
+                writeln!(
+                    writer,
+                    "# Document id: {doc_id}, starting_offset: {starting_offset}, bytes_length: {bytes_length}"
+                )
+                .unwrap();
+            }
 
             if bytes_length == u32::MAX || starting_offset == u32::MAX {
-                writeln!(writer, "Document is deleted or uninitialized").unwrap();
+                if !skip_document_content {
+                    writeln!(writer, "Document is deleted or uninitialized").unwrap();
+                }
             } else {
                 if docs.len() < bytes_length as usize {
                     docs.resize(bytes_length as usize, 0);
@@ -819,23 +829,30 @@ impl ZeboPage {
                     .read_exact_at(slice, starting_offset as u64)
                     .unwrap();
 
-                // if ![344583, 344584, 344585].contains(&doc_id) {
-                let probable_index = ProbableIndex(doc_id - starting_document_id);
-                let output = self
-                    .get_documents::<u64>(&[(doc_id, probable_index)])
-                    .unwrap();
-                assert_eq!(output.len(), 1);
-                let (f_doc_id, f_content) = &output[0];
-                assert_eq!(*f_doc_id, doc_id);
-                assert_eq!(*f_content, slice);
-                // }
+                if !skip_content_checks {
+                    let probable_index = ProbableIndex(doc_id - starting_document_id);
+                    let output = self
+                        .get_documents::<u64>(&[(doc_id, probable_index)])
+                        .unwrap();
+                    assert_eq!(output.len(), 1);
+                    let (f_doc_id, f_content) = &output[0];
+                    assert_eq!(*f_doc_id, doc_id);
+                    assert_eq!(*f_content, slice);
+                }
 
-                match String::from_utf8(slice.to_vec()) {
-                    Ok(s) => {
-                        writeln!(writer, "{s}").unwrap();
-                    }
-                    Err(_) => {
-                        writeln!(writer, "Document content: [binary data]").unwrap();
+                if !skip_document_content {
+                    match String::from_utf8(slice.to_vec()) {
+                        Ok(s) => {
+                            writeln!(writer, "{s}").unwrap();
+                        }
+                        Err(_) => {
+                            writeln!(
+                                writer,
+                                "Document content: [binary data of {} bytes]",
+                                slice.len()
+                            )
+                            .unwrap();
+                        }
                     }
                 }
             }

@@ -16,4 +16,9 @@ categories = [ "filesystem" ]
 [lib]
 name = "zebo"
 
+[[bin]]
+name = "zebo-inspect"
+path = "src/bin/zebo-inspect.rs"
+
 [dependencies]
+clap = { version = "4.0", features = ["derive"] }

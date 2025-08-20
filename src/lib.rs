@@ -397,9 +397,21 @@ impl<const MAX_DOC_PER_PAGE: u32, const PAGE_SIZE: u64, DocId: DocumentId>
         Ok(())
     }
 
-    pub fn debug_content(&self, page_id: u64, formatter: &mut dyn Write) -> Result<()> {
+    pub fn debug_content_with_options(
+        &self,
+        page_id: u64,
+        formatter: &mut dyn Write,
+        skip_content_checks: bool,
+        skip_document_content: bool,
+        skip_header_info: bool,
+    ) -> Result<()> {
         let page = load_page(&self.base_dir, PageId(page_id), Mode::Read)?;
-        page.debug_content(formatter)?;
+        page.debug_content_with_options(
+            formatter,
+            skip_content_checks,
+            skip_document_content,
+            skip_header_info,
+        )?;
         Ok(())
     }
 }
