@@ -1,5 +1,7 @@
 use std::{io::Write, os::unix::fs::FileExt};
 
+use tracing::{debug, instrument};
+
 use crate::{DocumentId, Result, Version, ZeboError, index::ProbableIndex};
 
 pub const VERSION_OFFSET: u64 = 0;
@@ -268,6 +270,7 @@ impl ZeboPage {
                                     .map_err(ZeboError::OperationError)?;
                             }
 
+                            debug!("Found with probable index");
                             r.push((DocId::from_u64(*doc_id), doc_buf));
                             continue;
                         } else {
@@ -485,6 +488,7 @@ impl ZeboPage {
     /// encountering a deleted entry with the target doc_id, even if a valid (non-deleted)
     /// entry with the same doc_id existed elsewhere in the page. This fix ensures we
     /// skip over deleted entries and continue searching until we find the actual document.
+    #[instrument(skip(self, hint_data), fields(target_doc_id = target_doc_id))]
     fn fallback_search_document(
         &self,
         target_doc_id: u64,
@@ -507,6 +511,7 @@ impl ZeboPage {
                     return Ok(None);
                 }
 
+                debug!("Found with hint");
                 return Ok(Some((doc_id, offset, len)));
             }
 
@@ -532,6 +537,7 @@ impl ZeboPage {
                             return Ok(None);
                         }
 
+                        debug!("Found with delta hint");
                         return Ok(Some((found_doc_id, document_offset, document_len)));
                     }
 
@@ -581,8 +587,10 @@ impl ZeboPage {
             -1
         };
 
+        let mut tries = 0;
         let mut current_index = starting_index;
         loop {
+            tries += 1;
             match self.get_at(current_index)? {
                 None => {
                     // Reached the end of the index without finding the document
@@ -607,6 +615,8 @@ impl ZeboPage {
 
                     // Found a valid (non-deleted) entry - check if it matches our target
                     if doc_id == target_doc_id {
+                        debug!(tries = ?tries, "Found after some retries");
+
                         return Ok(Some((doc_id, document_offset, document_len)));
                     }
 

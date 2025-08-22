@@ -501,7 +501,6 @@ impl<
                     // Anyway, that approach requires lifetimes handling
                     // TODO: use streams
 
-                    println!("Getting docs... {}", d.len());
                     match page.get_documents(&d) {
                         Ok(v) => {
                             self.current_v = Some(v);
