@@ -674,6 +674,34 @@ impl ZeboPage {
             }
         }
 
+        self.find_from_start(target_doc_id)
+    }
+
+    fn find_from_start(&self, target_doc_id: u64) -> Result<Option<(u64, u32, u32)>> {
+        let document_count = self.get_document_count()? as u64;
+
+        for i in 0..document_count {
+            match self.get_at(i) {
+                Ok(Some((doc_id, document_offset, document_len))) => {
+                    if doc_id == target_doc_id {
+                        if Self::is_uninitialized_entry(document_offset)
+                            || Self::is_deleted(doc_id, document_offset, document_len)
+                        {
+                            return Ok(None);
+                        }
+
+                        debug!("Found in full scan");
+                        return Ok(Some((doc_id, document_offset, document_len)));
+                    }
+                }
+                Ok(None) => break,
+                Err(e) => {
+                    error!("Error during full scan: {:?}", e);
+                    continue;
+                }
+            }
+        }
+
         Ok(None)
     }
 
@@ -1733,7 +1761,7 @@ mod tests {
         let r = page.reserve_space(5, 5).unwrap();
         r.write(b"ccccc").unwrap();
 
-        let a = page
+        let docs = page
             .get_documents::<u64>(&[
                 (1, ProbableIndex(0)),
                 (2, ProbableIndex(1)),
@@ -1743,11 +1771,70 @@ mod tests {
             ])
             .unwrap();
 
-        assert_eq!(a.len(), 5);
-        assert_eq!(a[0], (1, b"hello".to_vec()));
-        assert_eq!(a[1], (2, b"world".to_vec()));
-        assert_eq!(a[2], (3, b"bbbbb".to_vec()));
-        assert_eq!(a[3], (4, b"aaaaa".to_vec()));
-        assert_eq!(a[4], (5, b"ccccc".to_vec()));
+        assert_eq!(docs.len(), 5);
+        assert_eq!(docs[0], (1, b"hello".to_vec()));
+        assert_eq!(docs[1], (2, b"world".to_vec()));
+        assert_eq!(docs[2], (3, b"bbbbb".to_vec()));
+        assert_eq!(docs[3], (4, b"aaaaa".to_vec()));
+        assert_eq!(docs[4], (5, b"ccccc".to_vec()));
+
+        for doc_id in 1..=5 {
+            let docs = page.fallback_search_document(doc_id, None).unwrap();
+            assert!(docs.is_some());
+        }
+    }
+
+    #[test]
+    fn test_fallback_search_start_from_initial() {
+        // Test that fallback_search_document optimization chooses the optimal starting point
+        // when target is closer to the end of the page
+        use crate::tests::prepare_test_dir;
+
+        let _ = tracing_subscriber::fmt::try_init();
+
+        let test_dir = prepare_test_dir();
+        let file_path = test_dir.join("wrong_document_order.zebo");
+        let page_file = std::fs::File::options()
+            .create(true)
+            .truncate(true)
+            .read(true)
+            .write(true)
+            .open(&file_path)
+            .expect("Failed to create page file");
+
+        let mut page = ZeboPage::try_new(10, 1000, page_file).expect("Failed to create page");
+
+        let r = page.reserve_space(1, 5).unwrap();
+        r.write(b"hello").unwrap();
+        let r = page.reserve_space(2, 5).unwrap();
+        r.write(b"world").unwrap();
+        let r = page.reserve_space(4, 5).unwrap();
+        r.write(b"aaaaa").unwrap();
+        let r = page.reserve_space(3, 5).unwrap();
+        r.write(b"bbbbb").unwrap();
+        let r = page.reserve_space(5, 5).unwrap();
+        r.write(b"ccccc").unwrap();
+
+        let docs = page
+            .get_documents::<u64>(&[
+                (1, ProbableIndex(0)),
+                (2, ProbableIndex(1)),
+                (3, ProbableIndex(3)),
+                (4, ProbableIndex(2)),
+                (5, ProbableIndex(4)),
+            ])
+            .unwrap();
+
+        assert_eq!(docs.len(), 5);
+        assert_eq!(docs[0], (1, b"hello".to_vec()));
+        assert_eq!(docs[1], (2, b"world".to_vec()));
+        assert_eq!(docs[2], (3, b"bbbbb".to_vec()));
+        assert_eq!(docs[3], (4, b"aaaaa".to_vec()));
+        assert_eq!(docs[4], (5, b"ccccc".to_vec()));
+
+        for doc_id in 1..=5 {
+            let docs = page.find_from_start(doc_id).unwrap();
+            assert!(docs.is_some());
+        }
     }
 }
