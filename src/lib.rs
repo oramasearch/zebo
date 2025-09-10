@@ -313,6 +313,10 @@ impl<const MAX_DOC_PER_PAGE: u32, const PAGE_SIZE: u64, DocId: DocumentId>
         Ok(total_count)
     }
 
+    pub fn get_all_pages(&self) -> Result<Vec<(u64, PageId)>> {
+        self.index.get_all_pages()
+    }
+
     /// Returns information related the this Zebo instance
     pub fn get_info(&self) -> Result<ZeboInfo> {
         let mut page_headers = Vec::with_capacity(self.next_page_id as usize);
@@ -632,6 +636,7 @@ impl DocumentId for u64 {
 
 #[cfg(test)]
 mod tests {
+
     use super::*;
 
     pub fn prepare_test_dir() -> PathBuf {

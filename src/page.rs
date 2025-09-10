@@ -48,7 +48,7 @@ pub struct ZeboPage {
     document_limit: u32,
     #[allow(dead_code)]
     pub(crate) starting_document_id: u64,
-    page_file: std::fs::File,
+    pub(crate) page_file: std::fs::File,
     next_available_header_offset: u32,
 }
 
@@ -250,55 +250,88 @@ impl ZeboPage {
 
         for (doc_id, probable_index) in doc_id_with_index {
             // Try to get data at probable index if it's within bounds
-            let data_at_probable_index = if probable_index.0 < self.document_limit as u64 {
-                match self.get_at(probable_index.0)? {
-                    Some((found_id, document_offset, document_len)) => {
-                        // Check if this entry is a deletion
-                        if Self::is_deleted(found_id, document_offset, document_len)
-                            || Self::is_uninitialized_entry(document_offset)
-                        {
-                            Some((found_id, document_offset, document_len))
-                        } else if found_id == *doc_id {
-                            // Found the document at the probable index location
-                            let mut doc_buf = vec![0; document_len as usize];
-                            // document_len == 0 is an edge but valid case.
-                            // It means that the document is empty.
-                            // In this case, we don't need to read the document from the file
-                            if document_len > 0 {
-                                self.page_file
-                                    .read_exact_at(&mut doc_buf, document_offset as u64)
-                                    .map_err(ZeboError::OperationError)?;
-                            }
+            let mut probable_index = *probable_index;
 
-                            debug!("Found with probable index");
-                            r.push((DocId::from_u64(*doc_id), doc_buf));
-                            continue;
-                        } else {
-                            Some((found_id, document_offset, document_len))
-                        }
+            if probable_index.0 >= self.next_available_header_offset as u64 {
+                probable_index.0 = self.next_available_header_offset.saturating_sub(1) as u64;
+            }
+
+            let mut buff = [0; 16];
+            self.page_file
+                .read_exact_at(
+                    &mut buff,
+                    DOCUMENT_INDEX_OFFSET + (probable_index.0 * (4 + 4 + 8)),
+                )
+                .unwrap();
+            let found_id = u64::from_be_bytes([
+                buff[0], buff[1], buff[2], buff[3], buff[4], buff[5], buff[6], buff[7],
+            ]);
+            let document_offset = u32::from_be_bytes([buff[8], buff[9], buff[10], buff[11]]);
+            let document_len = u32::from_be_bytes([buff[12], buff[13], buff[14], buff[15]]);
+
+            if &found_id == doc_id {
+                if Self::is_uninitialized_entry(document_offset)
+                    || Self::is_deleted(found_id, document_offset, document_len)
+                {
+                    continue; // Found but deleted or uninitialized (supports both old and new deletion formats)
+                } else {
+                    // Found the document at the probable index location
+                    let mut doc_buf = vec![0; document_len as usize];
+                    // document_len == 0 is an edge but valid case.
+                    // It means that the document is empty.
+                    // In this case, we don't need to read the document from the file
+                    if document_len > 0 {
+                        self.page_file
+                            .read_exact_at(&mut doc_buf, document_offset as u64)
+                            .unwrap();
                     }
-                    None => None,
+
+                    debug!("Found with probable index");
+                    r.push((DocId::from_u64(*doc_id), doc_buf));
+                    // Next document
+                    continue;
                 }
+            }
+
+            // We need to apply a fallback logic
+
+            let mut probable_index = if *doc_id > found_id {
+                // The wanted document is after the found document
+                // We know it because the document IDs are in ascending order
+                let delta = doc_id - found_id;
+                ProbableIndex(probable_index.0 + delta)
             } else {
-                // ProbableIndex is out of bounds, so no data at probable index
-                None
+                // The wanted document is before the found document
+                // We know it because the document IDs are in ascending order
+                let delta = found_id - doc_id;
+                ProbableIndex(probable_index.0.saturating_sub(delta))
             };
 
-            let data_at_probable_index =
-                data_at_probable_index.and_then(|(found_id, document_offset, document_len)| {
-                    if Self::is_uninitialized_entry(document_offset)
-                        || Self::is_deleted(found_id, document_offset, document_len)
-                    {
-                        // Document is uninitialized or deleted (supports both old and new deletion formats). No hint
-                        return None;
-                    }
-                    Some((probable_index.0, (found_id, document_offset, document_len)))
-                });
+            if probable_index.0 >= self.next_available_header_offset as u64 {
+                probable_index.0 = self.next_available_header_offset.saturating_sub(1) as u64;
+            }
 
-            // Fallback: use fallback algorithm search if probable index failed or was out of bounds
-            if let Some((_, document_offset, document_len)) =
-                self.fallback_search_document(*doc_id, data_at_probable_index)?
-            {
+            self.page_file
+                .read_exact_at(
+                    &mut buff,
+                    DOCUMENT_INDEX_OFFSET + (probable_index.0 * (4 + 4 + 8)),
+                )
+                .unwrap();
+            let new_found_id = u64::from_be_bytes([
+                buff[0], buff[1], buff[2], buff[3], buff[4], buff[5], buff[6], buff[7],
+            ]);
+            let new_document_offset = u32::from_be_bytes([buff[8], buff[9], buff[10], buff[11]]);
+            let new_document_len = u32::from_be_bytes([buff[12], buff[13], buff[14], buff[15]]);
+
+            let a = self.fallback_search_document(
+                *doc_id,
+                Some((
+                    probable_index.0,
+                    (new_found_id, new_document_offset, new_document_len),
+                )),
+            );
+
+            if let Ok(Some((_, document_offset, document_len))) = a {
                 let mut doc_buf = vec![0; document_len as usize];
                 // document_len == 0 is an edge but valid case.
                 // It means that the document is empty.
@@ -310,8 +343,11 @@ impl ZeboPage {
                 }
 
                 r.push((DocId::from_u64(*doc_id), doc_buf));
+                continue;
+            } else if let Err(e) = a {
+                error!("Error during fallback search: {:?}", e);
+                continue;
             }
-            // If it returns None, the document doesn't exist or is deleted
         }
 
         Ok(r)
@@ -515,7 +551,10 @@ impl ZeboPage {
                 return Ok(Some((doc_id, offset, len)));
             }
 
-            let document_count = self.get_document_count()? as u64;
+            let document_count = self.next_available_header_offset as u64;
+            if document_count == 0 {
+                return Ok(None);
+            }
 
             let most_probable_index = if doc_id < target_doc_id {
                 (target_doc_id - doc_id + index).min(document_count - 1)
@@ -555,7 +594,7 @@ impl ZeboPage {
             //     Compare the distance between the first and last document ids
             //     Choose the closest one as the starting point
 
-            let document_count = self.get_document_count()?;
+            let document_count = self.next_available_header_offset;
             if document_count == 0 {
                 return Ok(None);
             }
@@ -594,7 +633,7 @@ impl ZeboPage {
             match self.get_at(current_index)? {
                 None => {
                     // Reached the end of the index without finding the document
-                    return Ok(None);
+                    return self.find_in_range(target_doc_id, starting_index, 50);
                 }
                 Some((doc_id, document_offset, document_len)) => {
                     // CRITICAL FIX: Check if this entry is deleted/uninitialized BEFORE checking doc_id
@@ -652,25 +691,36 @@ impl ZeboPage {
         let starting_index = index.saturating_sub(delta);
         let ending_index = index + delta;
 
+        let mut buf = [0; 16];
         for i in starting_index..=ending_index {
-            match self.get_at(i) {
-                Ok(Some((doc_id, document_offset, document_len))) => {
-                    if doc_id == target_doc_id {
-                        if Self::is_uninitialized_entry(document_offset)
-                            || Self::is_deleted(doc_id, document_offset, document_len)
-                        {
-                            return Ok(None);
-                        }
-
-                        debug!("Found in range search");
-                        return Ok(Some((doc_id, document_offset, document_len)));
-                    }
-                }
-                Ok(None) => break,
+            match self
+                .page_file
+                .read_exact_at(&mut buf, DOCUMENT_INDEX_OFFSET + (i * (4 + 4 + 8)))
+            {
+                Ok(_) => {}
                 Err(e) => {
-                    error!("Error during range search: {:?}", e);
-                    continue;
+                    if e.kind() == std::io::ErrorKind::UnexpectedEof {
+                        // Reached the end of the file
+                        break;
+                    }
+                    return Err(ZeboError::OperationError(e));
                 }
+            };
+            let doc_id = u64::from_be_bytes([
+                buf[0], buf[1], buf[2], buf[3], buf[4], buf[5], buf[6], buf[7],
+            ]);
+            let document_offset = u32::from_be_bytes([buf[8], buf[9], buf[10], buf[11]]);
+            let document_len = u32::from_be_bytes([buf[12], buf[13], buf[14], buf[15]]);
+
+            if doc_id == target_doc_id {
+                if Self::is_uninitialized_entry(document_offset)
+                    || Self::is_deleted(doc_id, document_offset, document_len)
+                {
+                    return Ok(None);
+                }
+
+                debug!("Found in range search");
+                return Ok(Some((doc_id, document_offset, document_len)));
             }
         }
 
@@ -678,26 +728,34 @@ impl ZeboPage {
     }
 
     fn find_from_start(&self, target_doc_id: u64) -> Result<Option<(u64, u32, u32)>> {
-        let document_count = self.get_document_count()? as u64;
-
-        for i in 0..document_count {
-            match self.get_at(i) {
-                Ok(Some((doc_id, document_offset, document_len))) => {
+        let mut buf = [0; 16];
+        for i in 0..=1179623 {
+            match self
+                .page_file
+                .read_exact_at(&mut buf, DOCUMENT_INDEX_OFFSET + (i * (4 + 4 + 8)))
+            {
+                Ok(_) => {
+                    let doc_id = u64::from_be_bytes([
+                        buf[0], buf[1], buf[2], buf[3], buf[4], buf[5], buf[6], buf[7],
+                    ]);
+                    let document_offset = u32::from_be_bytes([buf[8], buf[9], buf[10], buf[11]]);
+                    let document_len = u32::from_be_bytes([buf[12], buf[13], buf[14], buf[15]]);
                     if doc_id == target_doc_id {
                         if Self::is_uninitialized_entry(document_offset)
                             || Self::is_deleted(doc_id, document_offset, document_len)
                         {
                             return Ok(None);
+                        } else {
+                            return Ok(Some((doc_id, document_offset, document_len)));
                         }
-
-                        debug!("Found in full scan");
-                        return Ok(Some((doc_id, document_offset, document_len)));
                     }
                 }
-                Ok(None) => break,
                 Err(e) => {
-                    error!("Error during full scan: {:?}", e);
-                    continue;
+                    if e.kind() == std::io::ErrorKind::UnexpectedEof {
+                        // Reached the end of the file
+                        break;
+                    }
+                    return Err(ZeboError::OperationError(e));
                 }
             }
         }
@@ -867,8 +925,8 @@ impl ZeboPage {
         let mut i = -1_i128;
         loop {
             i += 1;
-
-            if i > document_count as i128 {
+            if i > self.next_available_header_offset as i128 {
+                // Reach the end
                 break;
             }
 
@@ -876,12 +934,27 @@ impl ZeboPage {
             if doc_id == [0; 8] {
                 break;
             }
-            self.page_file
+            match self
+                .page_file
                 .read_exact_at(&mut starting_offset, offset + 8)
-                .unwrap();
-            self.page_file
-                .read_exact_at(&mut bytes_length, offset + 12)
-                .unwrap();
+            {
+                Ok(_) => {}
+                Err(e) => {
+                    if e.kind() == std::io::ErrorKind::UnexpectedEof {
+                        break;
+                    }
+                    return Err(ZeboError::OperationError(e));
+                }
+            };
+            match self.page_file.read_exact_at(&mut bytes_length, offset + 12) {
+                Ok(_) => {}
+                Err(e) => {
+                    if e.kind() == std::io::ErrorKind::UnexpectedEof {
+                        break;
+                    }
+                    return Err(ZeboError::OperationError(e));
+                }
+            };
             let doc_id = u64::from_be_bytes(doc_id);
 
             offset += 8 + 4 + 4;
@@ -899,6 +972,10 @@ impl ZeboPage {
 
             let starting_offset = u32::from_be_bytes(starting_offset);
             let bytes_length = u32::from_be_bytes(bytes_length);
+
+            if Self::is_uninitialized_entry(starting_offset) {
+                break; // reach the end
+            }
 
             if !skip_header_info {
                 writeln!(
@@ -924,9 +1001,13 @@ impl ZeboPage {
                 let slice = &mut docs[0..bytes_length as usize];
 
                 if !skip_content_checks {
-                    self.page_file
-                        .read_exact_at(slice, starting_offset as u64)
-                        .unwrap();
+                    if let Err(e) = self.page_file.read_exact_at(slice, starting_offset as u64) {
+                        if e.kind() == std::io::ErrorKind::UnexpectedEof {
+                            writeln!(writer, "Document content: [incomplete data, expected length {bytes_length} bytes]").unwrap();
+                            continue;
+                        }
+                        return Err(ZeboError::OperationError(e));
+                    }
                     let probable_index = ProbableIndex(doc_id - starting_document_id);
                     let output = self
                         .get_documents::<u64>(&[(doc_id, probable_index)])

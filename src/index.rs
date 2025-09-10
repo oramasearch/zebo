@@ -179,7 +179,25 @@ impl<DocId: DocumentId> ZeboIndex<DocId> {
 
         Ok(())
     }
+
+    pub fn get_all_pages(&self) -> Result<Vec<(u64, PageId)>> {
+        let mut buf = vec![0; (self.offset - 8 - 1) as usize];
+        self.index_file
+            .read_exact_at(&mut buf, 9)
+            .map_err(ZeboError::OperationError)?;
+
+        let expected_page_size = (self.offset - 8 - 1) / (8 + 8);
+
+        let mut pages = Vec::with_capacity(expected_page_size as usize);
+        for chunk in buf.chunks_exact(16) {
+            let page_id = u64::from_be_bytes(chunk[0..8].try_into().unwrap());
+            let starting_doc_id = u64::from_be_bytes(chunk[8..16].try_into().unwrap());
+            pages.push((starting_doc_id, PageId(page_id)));
+        }
+
+        Ok(pages)
+    }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 pub struct ProbableIndex(pub u64);
