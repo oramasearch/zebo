@@ -1,3 +1,5 @@
 /target
 zebo_test
 zebo_data_dir
+zebo-*.tar.gz
+.data

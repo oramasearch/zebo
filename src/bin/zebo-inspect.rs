@@ -37,6 +37,14 @@ struct Cli {
     /// Skip printing header information (version, counts, offsets)
     #[arg(long)]
     skip_header_info: bool,
+
+    /// Print information about a specific document ID
+    #[arg(long)]
+    doc_id: Option<u64>,
+
+    /// Print information about a specific document ID
+    #[arg(long)]
+    starting_doc_id: Option<u64>,
 }
 
 // 1 GB
@@ -56,6 +64,8 @@ fn main() {
         cli.skip_content_checks,
         cli.skip_document_content,
         cli.skip_header_info,
+        cli.doc_id,
+        cli.starting_doc_id,
     )
     .expect("Failed to debug content");
 

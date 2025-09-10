@@ -60,13 +60,13 @@ impl<const MAX_DOC_PER_PAGE: u32, const PAGE_SIZE: u64, DocId: DocumentId>
 
         let base_dir: PathBuf = base_dir.as_ref().to_path_buf();
 
-        if let Err(error) = std::fs::create_dir(&base_dir) {
-            if error.kind() != std::io::ErrorKind::AlreadyExists {
-                return Err(ZeboError::CannotCreateBaseDir {
-                    inner_error: error,
-                    base_dir,
-                });
-            }
+        if let Err(error) = std::fs::create_dir(&base_dir)
+            && error.kind() != std::io::ErrorKind::AlreadyExists
+        {
+            return Err(ZeboError::CannotCreateBaseDir {
+                inner_error: error,
+                base_dir,
+            });
         }
 
         if !base_dir.is_dir() {
@@ -397,6 +397,7 @@ impl<const MAX_DOC_PER_PAGE: u32, const PAGE_SIZE: u64, DocId: DocumentId>
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn debug_content_with_options(
         &self,
         page_id: u64,
@@ -404,6 +405,8 @@ impl<const MAX_DOC_PER_PAGE: u32, const PAGE_SIZE: u64, DocId: DocumentId>
         skip_content_checks: bool,
         skip_document_content: bool,
         skip_header_info: bool,
+        doc_id: Option<u64>,
+        starting_doc_id: Option<u64>,
     ) -> Result<()> {
         let page = load_page(&self.base_dir, PageId(page_id), Mode::Read)?;
         page.debug_content_with_options(
@@ -411,6 +414,8 @@ impl<const MAX_DOC_PER_PAGE: u32, const PAGE_SIZE: u64, DocId: DocumentId>
             skip_content_checks,
             skip_document_content,
             skip_header_info,
+            doc_id,
+            starting_doc_id,
         )?;
         Ok(())
     }
@@ -483,10 +488,10 @@ impl<
     type Item = Result<(DocId, Vec<u8>)>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        if let Some(docs) = self.current_v.as_ref() {
-            if docs.is_empty() {
-                self.current_v = None;
-            }
+        if let Some(docs) = self.current_v.as_ref()
+            && docs.is_empty()
+        {
+            self.current_v = None;
         }
 
         if self.current_v.is_none() {

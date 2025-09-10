@@ -1,6 +1,6 @@
 use std::{io::Write, os::unix::fs::FileExt};
 
-use tracing::{debug, instrument};
+use tracing::{debug, error, instrument};
 
 use crate::{DocumentId, Result, Version, ZeboError, index::ProbableIndex};
 
@@ -625,7 +625,8 @@ impl ZeboPage {
                     if current_delta != delta {
                         // We have passed the target document in the sorted order
                         // This means the target doesn't exist in this page
-                        return Ok(None);
+                        // Anyway, we do a final range search around the starting index
+                        return self.find_in_range(target_doc_id, starting_index, 50);
                     }
 
                     let temp_current_index = current_index as i128 + current_delta as i128;
@@ -639,6 +640,40 @@ impl ZeboPage {
         }
 
         // Document not found
+        Ok(None)
+    }
+
+    fn find_in_range(
+        &self,
+        target_doc_id: u64,
+        index: u64,
+        delta: u64,
+    ) -> Result<Option<(u64, u32, u32)>> {
+        let starting_index = index.saturating_sub(delta);
+        let ending_index = index + delta;
+
+        for i in starting_index..=ending_index {
+            match self.get_at(i) {
+                Ok(Some((doc_id, document_offset, document_len))) => {
+                    if doc_id == target_doc_id {
+                        if Self::is_uninitialized_entry(document_offset)
+                            || Self::is_deleted(doc_id, document_offset, document_len)
+                        {
+                            return Ok(None);
+                        }
+
+                        debug!("Found in range search");
+                        return Ok(Some((doc_id, document_offset, document_len)));
+                    }
+                }
+                Ok(None) => break,
+                Err(e) => {
+                    error!("Error during range search: {:?}", e);
+                    continue;
+                }
+            }
+        }
+
         Ok(None)
     }
 
@@ -741,6 +776,8 @@ impl ZeboPage {
         skip_content_checks: bool,
         skip_document_content: bool,
         skip_header_info: bool,
+        wanted_doc_id: Option<u64>,
+        starting_doc_id: Option<u64>,
     ) -> Result<()> {
         let mut buf = [0; 1];
         self.page_file
@@ -799,7 +836,14 @@ impl ZeboPage {
         let mut starting_offset = [0; 4];
         let mut bytes_length = [0; 4];
         let mut docs: Vec<u8> = vec![];
+        let mut i = -1_i128;
         loop {
+            i += 1;
+
+            if i > document_count as i128 {
+                break;
+            }
+
             self.page_file.read_exact_at(&mut doc_id, offset).unwrap();
             if doc_id == [0; 8] {
                 break;
@@ -810,8 +854,20 @@ impl ZeboPage {
             self.page_file
                 .read_exact_at(&mut bytes_length, offset + 12)
                 .unwrap();
-
             let doc_id = u64::from_be_bytes(doc_id);
+
+            offset += 8 + 4 + 4;
+
+            if let Some(wanted_doc_id) = wanted_doc_id
+                && doc_id != wanted_doc_id
+            {
+                continue;
+            }
+            if let Some(starting_doc_id) = starting_doc_id
+                && doc_id < starting_doc_id
+            {
+                continue;
+            }
 
             let starting_offset = u32::from_be_bytes(starting_offset);
             let bytes_length = u32::from_be_bytes(bytes_length);
@@ -819,9 +875,13 @@ impl ZeboPage {
             if !skip_header_info {
                 writeln!(
                     writer,
-                    "# Document id: {doc_id}, starting_offset: {starting_offset}, bytes_length: {bytes_length}"
+                    "# {i} - Document id: {doc_id}, starting_offset: {starting_offset}, bytes_length: {bytes_length}"
                 )
                 .unwrap();
+            }
+
+            if doc_id == u64::MAX {
+                break; // reach the end
             }
 
             if bytes_length == u32::MAX || starting_offset == u32::MAX {
@@ -835,22 +895,24 @@ impl ZeboPage {
 
                 let slice = &mut docs[0..bytes_length as usize];
 
-                self.page_file
-                    .read_exact_at(slice, starting_offset as u64)
-                    .unwrap();
-
                 if !skip_content_checks {
+                    self.page_file
+                        .read_exact_at(slice, starting_offset as u64)
+                        .unwrap();
                     let probable_index = ProbableIndex(doc_id - starting_document_id);
                     let output = self
                         .get_documents::<u64>(&[(doc_id, probable_index)])
                         .unwrap();
-                    assert_eq!(output.len(), 1);
+                    assert_eq!(output.len(), 1, "Document id {doc_id} not found");
                     let (f_doc_id, f_content) = &output[0];
-                    assert_eq!(*f_doc_id, doc_id);
-                    assert_eq!(*f_content, slice);
+                    assert_eq!(*f_doc_id, doc_id, "Document id mismatch");
+                    assert_eq!(*f_content, slice, "Document content mismatch");
                 }
 
                 if !skip_document_content {
+                    self.page_file
+                        .read_exact_at(slice, starting_offset as u64)
+                        .unwrap();
                     match String::from_utf8(slice.to_vec()) {
                         Ok(s) => {
                             writeln!(writer, "{s}").unwrap();
@@ -866,8 +928,6 @@ impl ZeboPage {
                     }
                 }
             }
-
-            offset += 8 + 4 + 4;
         }
 
         Ok(())
@@ -1593,6 +1653,8 @@ mod tests {
         // when target is closer to the end of the page
         use crate::tests::prepare_test_dir;
 
+        let _ = tracing_subscriber::fmt::try_init();
+
         let test_dir = prepare_test_dir();
         let file_path = test_dir.join("optimization_test_page.zebo");
         let page_file = std::fs::File::options()
@@ -1638,5 +1700,54 @@ mod tests {
             .fallback_search_document(150, None)
             .expect("Search failed");
         assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_fallback_search_wrong_document_order() {
+        // Test that fallback_search_document optimization chooses the optimal starting point
+        // when target is closer to the end of the page
+        use crate::tests::prepare_test_dir;
+
+        let _ = tracing_subscriber::fmt::try_init();
+
+        let test_dir = prepare_test_dir();
+        let file_path = test_dir.join("wrong_document_order.zebo");
+        let page_file = std::fs::File::options()
+            .create(true)
+            .truncate(true)
+            .read(true)
+            .write(true)
+            .open(&file_path)
+            .expect("Failed to create page file");
+
+        let mut page = ZeboPage::try_new(10, 1000, page_file).expect("Failed to create page");
+
+        let r = page.reserve_space(1, 5).unwrap();
+        r.write(b"hello").unwrap();
+        let r = page.reserve_space(2, 5).unwrap();
+        r.write(b"world").unwrap();
+        let r = page.reserve_space(4, 5).unwrap();
+        r.write(b"aaaaa").unwrap();
+        let r = page.reserve_space(3, 5).unwrap();
+        r.write(b"bbbbb").unwrap();
+        let r = page.reserve_space(5, 5).unwrap();
+        r.write(b"ccccc").unwrap();
+
+        let a = page
+            .get_documents::<u64>(&[
+                (1, ProbableIndex(0)),
+                (2, ProbableIndex(1)),
+                (3, ProbableIndex(3)),
+                (4, ProbableIndex(2)),
+                (5, ProbableIndex(4)),
+            ])
+            .unwrap();
+
+        assert_eq!(a.len(), 5);
+        assert_eq!(a[0], (1, b"hello".to_vec()));
+        assert_eq!(a[1], (2, b"world".to_vec()));
+        assert_eq!(a[2], (3, b"bbbbb".to_vec()));
+        assert_eq!(a[3], (4, b"aaaaa".to_vec()));
+        assert_eq!(a[4], (5, b"ccccc".to_vec()));
     }
 }
