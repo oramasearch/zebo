@@ -49,7 +49,7 @@ pub struct ZeboPage {
     #[allow(dead_code)]
     pub(crate) starting_document_id: u64,
     pub(crate) page_file: std::fs::File,
-    next_available_header_offset: u32,
+    pub(crate) next_available_header_offset: u32,
 }
 
 impl ZeboPage {

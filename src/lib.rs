@@ -344,7 +344,7 @@ impl<const MAX_DOC_PER_PAGE: u32, const PAGE_SIZE: u64, DocId: DocumentId>
         let mut page_size_remain = 0;
 
         if let Some((_, page)) = self.current_page.as_mut() {
-            let document_count = page.get_document_count()?;
+            let document_count = page.next_available_header_offset;
             let page_size = page.current_file_size()?;
 
             // If the current page is full, we need to create a new one
