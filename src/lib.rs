@@ -1,3 +1,4 @@
+#![cfg_attr(coverage_nightly, feature(coverage_attribute))]
 #![allow(clippy::test_attr_in_doctest)]
 #![allow(clippy::needless_doctest_main)]
 #![doc = include_str!("../README.md")]
@@ -17,6 +18,8 @@ use std::{
 pub use error::*;
 use index::{ProbableIndex, ZeboIndex};
 use page::{DOCUMENT_INDEX_OFFSET, ZeboPage, ZeboPageHeader};
+
+pub use crate::page::ZeboPageReservedSpace;
 
 #[derive(Debug, PartialEq)]
 pub struct ZeboInfo {
@@ -113,113 +116,37 @@ impl<const MAX_DOC_PER_PAGE: u32, const PAGE_SIZE: u64, DocId: DocumentId>
         })
     }
 
-    /// Add documents to Zebo
-    pub fn add_documents<W: Document, I: IntoIterator<Item = (DocId, W)>>(
+    pub fn reserve_space_for<'docs, Doc: Document>(
         &mut self,
-        docs: I,
-    ) -> Result<()> {
-        let (mut doc_count_remain, mut page_size_remain) = self.get_initial_remains()?;
-
-        let mut v = Vec::new();
-        for (doc_id, doc) in docs {
-            doc.as_bytes(&mut v);
-            let doc_len = v.len() as u32;
-
-            if doc_count_remain == 0 || page_size_remain < doc_len as u64 {
-                self.current_page = None;
-            }
-
-            let (_, page) = match self.current_page.as_mut() {
-                Some(page) => page,
-                None => {
-                    self.build_next_page(doc_id)?;
-                    doc_count_remain = MAX_DOC_PER_PAGE;
-                    page_size_remain = PAGE_SIZE;
-                    self.current_page.as_mut().expect("Page should be created")
-                }
-            };
-
-            // For each document, reserve and write
-            page.reserve_space(doc_id.as_u64(), doc_len)?.write(&v)?;
-            v.clear();
-
-            doc_count_remain -= 1;
-            page_size_remain = page_size_remain.saturating_sub(doc_len as u64)
+        docs: &'docs [(DocId, Doc)],
+    ) -> Result<ZeboPageReservedSpace<'docs, DocId, Doc>> {
+        let document_count = docs.len() as u32;
+        if document_count > MAX_DOC_PER_PAGE {
+            return Err(ZeboError::TooManyDocuments {
+                max: MAX_DOC_PER_PAGE,
+                got: document_count,
+            });
         }
 
-        Ok(())
-    }
+        if let Some((_, page)) = self.current_page.as_mut() {
+            let total_document_count_in_page = page.next_available_header_offset;
+            let remain = MAX_DOC_PER_PAGE.saturating_sub(total_document_count_in_page);
 
-    /// Add documents to Zebo in batch
-    pub fn add_documents_batch<W: Document, I: IntoIterator<Item = (DocId, W)>>(
-        &mut self,
-        docs: I,
-        batch_size: usize,
-        expected_size_per_document: usize,
-    ) -> Result<()> {
-        let (mut doc_count_remain, mut page_size_remain) = self.get_initial_remains()?;
-
-        let mut batch = Vec::with_capacity(batch_size);
-        let mut batch_doc: Vec<u8> = Vec::with_capacity(batch_size * expected_size_per_document);
-        let mut bytes: u64 = 0;
-        let mut v = Vec::new();
-        for (doc_id, doc) in docs {
-            doc.as_bytes(&mut v);
-            let doc_len = v.len() as u32;
-
-            if doc_count_remain == 0 || page_size_remain < bytes {
-                self.current_page = None;
-            }
-            if self.current_page.is_none() {
-                self.build_next_page(doc_id)?;
-                doc_count_remain = MAX_DOC_PER_PAGE;
-                page_size_remain = PAGE_SIZE;
-            }
-
-            batch.push((doc_id.as_u64(), doc_len));
-            batch_doc.extend(&v);
-            v.clear();
-
-            doc_count_remain -= 1;
-            bytes = page_size_remain.saturating_sub(doc_len as u64);
-
-            // When capacity is reached, we eventully create a page and insert the documents there
-            if batch.len() == batch_size {
-                let (_, page) = match self.current_page.as_mut() {
-                    Some(page) => page,
-                    None => {
-                        let doc_id = batch.first().expect("").0;
-                        self.build_next_page(DocId::from_u64(doc_id))?;
-                        doc_count_remain = MAX_DOC_PER_PAGE;
-                        page_size_remain = PAGE_SIZE;
-                        self.current_page.as_mut().expect("Page should be created")
-                    }
-                };
-
-                let reserved_spaces = page.reserve_multiple_space(batch.len(), batch.iter())?;
-                reserved_spaces.write(batch_doc.clone())?;
+            if remain < document_count {
                 page.close()?;
-                batch.clear();
-                batch_doc.clear();
+                self.current_page = None;
             }
         }
 
-        if !batch.is_empty() {
-            let (_, page) = match self.current_page.as_mut() {
-                Some(page) => page,
-                None => {
-                    let doc_id = batch.first().expect("").0;
-                    self.build_next_page(DocId::from_u64(doc_id))?;
-                    self.current_page.as_mut().expect("Page should be created")
-                }
-            };
-
-            let reserved_spaces = page.reserve_multiple_space(batch.len(), batch.iter())?;
-            reserved_spaces.write(batch_doc)?;
-            page.close()?;
+        if self.current_page.is_none() {
+            self.build_next_page(docs[0].0)?;
         }
 
-        Ok(())
+        let (_, current_page) = self.current_page.as_mut().expect("Set above");
+
+        let reserved_page = current_page.reserve(docs)?;
+
+        Ok(reserved_page)
     }
 
     /// Removes documents associated to the given ids
@@ -339,34 +266,6 @@ impl<const MAX_DOC_PER_PAGE: u32, const PAGE_SIZE: u64, DocId: DocumentId>
         })
     }
 
-    fn get_initial_remains(&mut self) -> Result<(u32, u64)> {
-        let mut doc_count_remain = 0;
-        let mut page_size_remain = 0;
-
-        if let Some((_, page)) = self.current_page.as_mut() {
-            let document_count = page.next_available_header_offset;
-            let page_size = page.current_file_size()?;
-
-            // If the current page is full, we need to create a new one
-            // Otherwise, we can use the current page till it is full
-            if page_size > PAGE_SIZE {
-                self.current_page = None;
-            } else {
-                page_size_remain = PAGE_SIZE - page_size;
-            }
-
-            // If the current page reaches the document limit, we need to create a new one
-            // Otherwise, we can use the current page till it reaches the document limit
-            if document_count >= MAX_DOC_PER_PAGE {
-                self.current_page = None;
-            } else {
-                doc_count_remain = MAX_DOC_PER_PAGE - document_count;
-            }
-        }
-
-        Ok((doc_count_remain, page_size_remain))
-    }
-
     fn build_next_page(&mut self, doc_id: DocId) -> Result<()> {
         if let Some((_, mut page)) = self.current_page.take() {
             // Close previous page
@@ -401,6 +300,7 @@ impl<const MAX_DOC_PER_PAGE: u32, const PAGE_SIZE: u64, DocId: DocumentId>
         Ok(())
     }
 
+    #[cfg_attr(coverage_nightly, coverage(off))]
     #[allow(clippy::too_many_arguments)]
     pub fn debug_content_with_options(
         &self,
@@ -453,6 +353,7 @@ fn load_page(base_dir: &Path, page_id: PageId, mode: Mode) -> Result<ZeboPage> {
     ZeboPage::try_load(page_file)
 }
 
+#[cfg_attr(coverage_nightly, coverage(off))]
 impl<const MAX_DOC_PER_PAGE: u32, const PAGE_SIZE: u64, DocId: DocumentId> Debug
     for Zebo<MAX_DOC_PER_PAGE, PAGE_SIZE, DocId>
 {
@@ -589,11 +490,19 @@ impl<
 
 pub trait Document {
     fn as_bytes(&self, v: &mut Vec<u8>);
+    fn len(&self) -> usize;
+    fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
 }
 
 impl<T: AsRef<[u8]>> Document for T {
     fn as_bytes(&self, v: &mut Vec<u8>) {
         v.extend(self.as_ref());
+    }
+
+    fn len(&self) -> usize {
+        self.as_ref().len()
     }
 }
 
@@ -653,844 +562,568 @@ mod tests {
         test_dir
     }
 
-    mod single {
-        use super::*;
+    #[test]
+    fn test_zebo_simple() {
+        let test_dir = prepare_test_dir();
 
-        #[test]
-        fn test_zebo_simple() {
-            let test_dir = prepare_test_dir();
+        let mut zebo: Zebo<5, 2048, u32> = Zebo::<5, 2048, _>::try_new(test_dir.clone()).unwrap();
 
-            let mut zebo: Zebo<2, 2048, u32> =
-                Zebo::<2, 2048, _>::try_new(test_dir.clone()).unwrap();
-            assert_eq!(zebo.next_page_id, 0);
+        let docs = vec![(1, "Hello")];
+        let space = zebo.reserve_space_for(&docs).unwrap();
 
-            let docs = vec![(1, "Hello")];
-            zebo.add_documents(docs).unwrap();
+        // Drop Zebo instance
+        drop(zebo);
 
-            let doc = zebo.get_document(1).unwrap().unwrap();
-            assert_eq!(doc, b"Hello");
+        // I can write to file without having a reference to Zebo
+        space.write_all().unwrap();
 
-            let docs: Result<Vec<_>> = zebo.get_documents(vec![1]).unwrap().collect();
-            let docs = docs.unwrap();
-            assert_eq!(docs, vec![(1, b"Hello".to_vec())]);
-        }
+        let zebo: Zebo<5, 2048, u32> = Zebo::<5, 2048, _>::try_new(test_dir.clone()).unwrap();
 
-        #[test]
-        fn test_zebo_pub() {
-            let test_dir = prepare_test_dir();
+        let doc = zebo.get_document(1).unwrap().unwrap();
+        assert_eq!(doc, b"Hello");
 
-            let mut zebo: Zebo<6, 2048, u32> =
-                Zebo::<6, 2048, _>::try_new(test_dir.clone()).unwrap();
-            assert_eq!(zebo.next_page_id, 0);
+        let docs: Result<Vec<_>> = zebo.get_documents(vec![1]).unwrap().collect();
+        let docs = docs.unwrap();
+        assert_eq!(docs, vec![(1, b"Hello".to_vec())]);
 
-            let docs = vec![(1, "Hello"), (2, "World"), (3, "Zebo")];
-            zebo.add_documents(docs).unwrap();
-
-            let doc = zebo.get_document(1).unwrap().unwrap();
-            assert_eq!(doc, b"Hello");
-            let doc = zebo.get_document(2).unwrap().unwrap();
-            assert_eq!(doc, b"World");
-            let doc = zebo.get_document(3).unwrap().unwrap();
-            assert_eq!(doc, b"Zebo");
-
-            let docs = vec![(4, "Test"), (5, "Document"), (6, "Storage")];
-            zebo.add_documents(docs).unwrap();
-
-            let doc = zebo.get_document(4).unwrap().unwrap();
-            assert_eq!(doc, b"Test");
-            let doc = zebo.get_document(5).unwrap().unwrap();
-            assert_eq!(doc, b"Document");
-            let doc = zebo.get_document(6).unwrap().unwrap();
-            assert_eq!(doc, b"Storage");
-
-            let document_count = zebo.get_document_count().unwrap();
-            assert_eq!(document_count, 6);
-
-            let res = zebo.get_document(7).unwrap();
-            assert!(res.is_none());
-        }
-
-        #[test]
-        fn test_zebo_paging_on_doc_size() {
-            let test_dir = prepare_test_dir();
-
-            let mut zebo: Zebo<10, 128, u32> =
-                Zebo::<10, 128, _>::try_new(test_dir.clone()).unwrap();
-            assert_eq!(zebo.next_page_id, 0);
-
-            let docs = vec![
-                (1, "1".repeat(100)),
-                (2, "2".repeat(100)),
-                (3, "3".repeat(100)),
-            ];
-            zebo.add_documents(docs).unwrap();
-
-            let doc = zebo.get_document(1).unwrap().unwrap();
-            assert_eq!(doc, b"1".repeat(100).to_vec());
-
-            let doc = zebo.get_document(2).unwrap().unwrap();
-            assert_eq!(doc, b"2".repeat(100).to_vec());
-
-            let doc = zebo.get_document(3).unwrap().unwrap();
-            assert_eq!(doc, b"3".repeat(100).to_vec());
-
-            let document_count = zebo.get_document_count().unwrap();
-            assert_eq!(document_count, 3);
-
-            let info = zebo.get_info().unwrap();
-            assert_eq!(info.page_headers.len(), 3);
-            assert_eq!(info.page_headers[0].document_count, 1);
-            assert_eq!(info.page_headers[1].document_count, 1);
-            assert_eq!(info.page_headers[2].document_count, 1);
-        }
-
-        #[test]
-        fn doc_size_limit_is_overcome_if_only_one() {
-            let test_dir = prepare_test_dir();
-
-            let mut zebo: Zebo<10, 128, u32> =
-                Zebo::<10, 128, _>::try_new(test_dir.clone()).unwrap();
-
-            let docs = vec![
-                (1, "1".repeat(200)),
-                (2, "2".repeat(100)),
-                (3, "3".repeat(200)),
-            ];
-            zebo.add_documents(docs).unwrap();
-
-            let doc = zebo.get_document(1).unwrap().unwrap();
-            assert_eq!(doc, b"1".repeat(200).to_vec());
-
-            let doc = zebo.get_document(2).unwrap().unwrap();
-            assert_eq!(doc, b"2".repeat(100).to_vec());
-
-            let doc = zebo.get_document(3).unwrap().unwrap();
-            assert_eq!(doc, b"3".repeat(200).to_vec());
-
-            let document_count = zebo.get_document_count().unwrap();
-            assert_eq!(document_count, 3);
-
-            let info = zebo.get_info().unwrap();
-            assert_eq!(info.page_headers.len(), 3);
-            assert_eq!(info.page_headers[0].document_count, 1);
-            assert_eq!(info.page_headers[1].document_count, 1);
-            assert_eq!(info.page_headers[2].document_count, 1);
-
-            let test_dir = prepare_test_dir();
-            let mut zebo: Zebo<10, 128, u32> =
-                Zebo::<10, 128, _>::try_new(test_dir.clone()).unwrap();
-            zebo.add_documents(vec![
-                (1, "1".repeat(40)),
-                (2, "2".repeat(40)),
-                (3, "3".repeat(200)),
-            ])
-            .unwrap();
-
-            let info = zebo.get_info().unwrap();
-            assert_eq!(info.page_headers.len(), 2);
-            assert_eq!(info.page_headers[0].document_count, 2);
-            assert_eq!(info.page_headers[1].document_count, 1);
-
-            let test_dir = prepare_test_dir();
-            let mut zebo: Zebo<10, 128, u32> =
-                Zebo::<10, 128, _>::try_new(test_dir.clone()).unwrap();
-            zebo.add_documents(vec![
-                (1, "1".repeat(200)),
-                (2, "2".repeat(40)),
-                (3, "3".repeat(40)),
-            ])
-            .unwrap();
-
-            let info = zebo.get_info().unwrap();
-            assert_eq!(info.page_headers.len(), 2);
-            assert_eq!(info.page_headers[0].document_count, 1);
-            assert_eq!(info.page_headers[1].document_count, 2);
-        }
-
-        #[test]
-        fn test_zebo_paging_on_doc_count() {
-            let test_dir = prepare_test_dir();
-
-            let mut zebo: Zebo<2, 2048, u32> =
-                Zebo::<2, 2048, _>::try_new(test_dir.clone()).unwrap();
-            assert_eq!(zebo.next_page_id, 0);
-
-            let docs = vec![(1, ""), (2, ""), (3, "")];
-            zebo.add_documents(docs).unwrap();
-
-            let doc = zebo.get_document(1).unwrap().unwrap();
-            assert_eq!(doc, b"");
-
-            let doc = zebo.get_document(2).unwrap().unwrap();
-            assert_eq!(doc, b"");
-
-            let doc = zebo.get_document(3).unwrap().unwrap();
-            assert_eq!(doc, b"");
-
-            let document_count = zebo.get_document_count().unwrap();
-            assert_eq!(document_count, 3);
-
-            let info = zebo.get_info().unwrap();
-            assert_eq!(info.page_headers.len(), 2);
-            assert_eq!(info.page_headers[0].document_count, 2);
-            assert_eq!(info.page_headers[1].document_count, 1);
-
-            let docs = vec![(4, ""), (5, ""), (6, "")];
-            zebo.add_documents(docs).unwrap();
-
-            let document_count = zebo.get_document_count().unwrap();
-            assert_eq!(document_count, 6);
-
-            let info = zebo.get_info().unwrap();
-            assert_eq!(info.page_headers.len(), 3);
-        }
-
-        #[test]
-        fn test_zebo_empty_doc() {
-            let test_dir = prepare_test_dir();
-
-            let mut zebo: Zebo<100, 2048, u32> =
-                Zebo::<100, 2048, _>::try_new(test_dir.clone()).unwrap();
-            assert_eq!(zebo.next_page_id, 0);
-
-            let docs = vec![(1, ""), (2, ""), (3, "")];
-            zebo.add_documents(docs).unwrap();
-
-            let doc = zebo.get_document(1).unwrap().unwrap();
-            assert_eq!(doc, b"");
-
-            let doc = zebo.get_document(2).unwrap().unwrap();
-            assert_eq!(doc, b"");
-
-            let doc = zebo.get_document(3).unwrap().unwrap();
-            assert_eq!(doc, b"");
-
-            let document_count = zebo.get_document_count().unwrap();
-            assert_eq!(document_count, 3);
-
-            let docs = vec![(4, ""), (5, ""), (6, "")];
-            zebo.add_documents(docs).unwrap();
-
-            let document_count = zebo.get_document_count().unwrap();
-            assert_eq!(document_count, 6);
-        }
-
-        #[test]
-        fn test_zebo_delete() {
-            let test_dir = prepare_test_dir();
-
-            let mut zebo: Zebo<5, 2048, u32> =
-                Zebo::<5, 2048, _>::try_new(test_dir.clone()).unwrap();
-            zebo.add_documents(vec![(1, "01234567890"), (2, "ABCFE"), (3, "FGHIL")])
-                .unwrap();
-
-            let info = zebo.get_info().unwrap();
-            assert_eq!(info.document_count, 3);
-
-            zebo.remove_documents(vec![1, 2], true).unwrap();
-
-            let err = zebo.get_document(1).unwrap();
-            assert!(err.is_none());
-            let err = zebo.get_document(2).unwrap();
-            assert!(err.is_none());
-            let doc = zebo.get_document(3).unwrap().unwrap();
-            assert_eq!(doc, b"FGHIL");
-
-            // Ignore unknown document
-            zebo.remove_documents(vec![55], true).unwrap();
-
-            let err = zebo.get_document(1).unwrap();
-            assert!(err.is_none());
-            let err = zebo.get_document(2).unwrap();
-            assert!(err.is_none());
-            let doc = zebo.get_document(3).unwrap().unwrap();
-            assert_eq!(doc, b"FGHIL");
-
-            // Ignore already deleted document
-            zebo.remove_documents(vec![1, 2], true).unwrap();
-
-            let err = zebo.get_document(1).unwrap();
-            assert!(err.is_none());
-            let err = zebo.get_document(2).unwrap();
-            assert!(err.is_none());
-            let doc = zebo.get_document(3).unwrap().unwrap();
-            assert_eq!(doc, b"FGHIL");
-
-            let info = zebo.get_info().unwrap();
-            assert_eq!(info.document_count, 1);
-        }
-
-        #[test]
-        fn test_zebo_get_documents() {
-            let test_dir = prepare_test_dir();
-
-            let mut zebo: Zebo<2, 2048, u32> =
-                Zebo::<2, 2048, _>::try_new(test_dir.clone()).unwrap();
-            assert_eq!(zebo.next_page_id, 0);
-
-            zebo.add_documents(vec![(1, "1"), (2, "2"), (3, "3")])
-                .unwrap();
-            zebo.add_documents(vec![(4, "4"), (5, "5"), (6, "6")])
-                .unwrap();
-
-            let output = zebo.get_document(1).unwrap().unwrap();
-            assert_eq!(output, b"1".to_vec());
-
-            let info = zebo.get_info().unwrap();
-            assert_eq!(info.page_headers.len(), 3);
-
-            let mut docs = zebo
-                .get_documents(vec![1, 3, 5, 6])
-                .unwrap()
-                .collect::<Result<Vec<_>>>()
-                .unwrap();
-            docs.sort_by_key(|d| d.0);
-            assert_eq!(
-                docs,
-                vec![
-                    (1, b"1".to_vec()),
-                    (3, b"3".to_vec()),
-                    (5, b"5".to_vec()),
-                    (6, b"6".to_vec()),
-                ]
-            );
-        }
-
-        #[test]
-        fn test_zebo_get_all_documents() {
-            let test_dir = prepare_test_dir();
-
-            let mut zebo: Zebo<2, 2048, u32> =
-                Zebo::<2, 2048, _>::try_new(test_dir.clone()).unwrap();
-
-            // Add documents across multiple pages
-            zebo.add_documents(vec![(1, "first"), (2, "second"), (3, "third")])
-                .unwrap();
-            zebo.add_documents(vec![(4, "fourth"), (5, "fifth"), (6, "sixth")])
-                .unwrap();
-
-            // Get all documents and verify they're all returned
-            let mut all_docs = zebo
-                .get_all_documents()
-                .unwrap()
-                .collect::<Result<Vec<_>>>()
-                .unwrap();
-
-            // Sort for comparison since order is not guaranteed
-            all_docs.sort_by_key(|d| d.0);
-
-            assert_eq!(all_docs.len(), 6);
-            assert_eq!(
-                all_docs,
-                vec![
-                    (1, b"first".to_vec()),
-                    (2, b"second".to_vec()),
-                    (3, b"third".to_vec()),
-                    (4, b"fourth".to_vec()),
-                    (5, b"fifth".to_vec()),
-                    (6, b"sixth".to_vec()),
-                ]
-            );
-
-            // Test with empty storage
-            let test_dir_empty = prepare_test_dir();
-            let zebo_empty: Zebo<2, 2048, u32> =
-                Zebo::<2, 2048, _>::try_new(test_dir_empty).unwrap();
-
-            let empty_docs: Vec<_> = zebo_empty
-                .get_all_documents()
-                .unwrap()
-                .collect::<Result<Vec<_>>>()
-                .unwrap();
-            assert_eq!(empty_docs.len(), 0);
-        }
-
-        #[test]
-        fn test_zebo_get_all_documents_with_deletions() {
-            let test_dir = prepare_test_dir();
-
-            let mut zebo: Zebo<5, 2048, u32> =
-                Zebo::<5, 2048, _>::try_new(test_dir.clone()).unwrap();
-
-            // Add documents to a single page to avoid the page file issue
-            zebo.add_documents(vec![
-                (1, "first"),
-                (2, "second"),
-                (3, "third"),
-                (4, "fourth"),
-            ])
-            .unwrap();
-
-            // Remove some documents
-            zebo.remove_documents(vec![2, 4], true).unwrap();
-
-            let mut remaining_docs = zebo
-                .get_all_documents()
-                .unwrap()
-                .collect::<Result<Vec<_>>>()
-                .unwrap();
-            remaining_docs.sort_by_key(|d| d.0);
-
-            assert_eq!(remaining_docs.len(), 2);
-            assert_eq!(
-                remaining_docs,
-                vec![(1, b"first".to_vec()), (3, b"third".to_vec()),]
-            );
-        }
-
-        #[test]
-        fn test_zebo_re_create() {
-            let test_dir = prepare_test_dir();
-
-            let mut zebo: Zebo<2, 2048, u32> =
-                Zebo::<2, 2048, _>::try_new(test_dir.clone()).unwrap();
-            assert_eq!(zebo.next_page_id, 0);
-
-            zebo.add_documents(vec![(1, "1"), (2, "2"), (3, "3")])
-                .unwrap();
-            zebo.add_documents(vec![(4, "4"), (5, "5"), (6, "6")])
-                .unwrap();
-
-            // Create a new instance that points to the same directory
-            // In this case we expect to reload the pages correctly
-            let zebo: Zebo<2, 2048, u32> = Zebo::<2, 2048, _>::try_new(test_dir.clone()).unwrap();
-
-            let output = zebo.get_document(1).unwrap().unwrap();
-            assert_eq!(output, b"1".to_vec());
-
-            let info = zebo.get_info().unwrap();
-            assert_eq!(info.page_headers.len(), 3);
-
-            let mut docs = zebo
-                .get_documents(vec![1, 3, 5, 6])
-                .unwrap()
-                .collect::<Result<Vec<_>>>()
-                .unwrap();
-            docs.sort_by_key(|d| d.0);
-            assert_eq!(
-                docs,
-                vec![
-                    (1, b"1".to_vec()),
-                    (3, b"3".to_vec()),
-                    (5, b"5".to_vec()),
-                    (6, b"6".to_vec()),
-                ]
-            );
-        }
-
-        #[test]
-        fn test_zebo_with_gap() -> Result<()> {
-            let test_dir = prepare_test_dir();
-
-            let mut zebo: Zebo<2, 2048, u32> =
-                Zebo::<2, 2048, _>::try_new(test_dir.clone()).unwrap();
-            assert_eq!(zebo.next_page_id, 0);
-
-            zebo.add_documents(vec![(1, "1"), (3, "3"), (5, "5")])
-                .unwrap();
-            zebo.add_documents(vec![(7, "7"), (9, "9"), (11, "11")])
-                .unwrap();
-
-            let info = zebo.get_info().unwrap();
-            assert_eq!(info.document_count, 6);
-
-            let output: Result<Vec<_>> = zebo
-                .get_documents(vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12])
-                .unwrap()
-                .collect();
-            let mut output = output.unwrap();
-            output.sort_by_key(|d| d.0);
-
-            let info = zebo.get_info().unwrap();
-            assert_eq!(info.page_headers.len(), 3);
-
-            let docs = zebo
-                .get_documents(vec![1, 3, 5, 6])
-                .unwrap()
-                .collect::<Result<Vec<_>>>()
-                .unwrap();
-            assert_eq!(docs.len(), 3);
-
-            let removed = zebo.remove_documents(vec![1, 2, 3, 4, 5], false).unwrap();
-            assert_eq!(removed, 3);
-
-            let docs = zebo
-                .get_documents(vec![1, 3, 5, 6])
-                .unwrap()
-                .collect::<Result<Vec<_>>>()
-                .unwrap();
-            assert_eq!(docs.len(), 0);
-
-            let info = zebo.get_info().unwrap();
-            assert_eq!(info.document_count, 3);
-
-            zebo.add_documents(vec![(13, "13"), (15, "15")]).unwrap();
-            assert_eq!(docs.len(), 0);
-
-            let info = zebo.get_info().unwrap();
-            assert_eq!(info.document_count, 5);
-
-            let mut docs = zebo
-                .get_documents(vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16])
-                .unwrap()
-                .collect::<Result<Vec<_>>>()
-                .unwrap();
-            assert_eq!(docs.len(), 5);
-            docs.sort_by_key(|d| d.0);
-            assert_eq!(
-                docs,
-                vec![
-                    (7, b"7".to_vec()),
-                    (9, b"9".to_vec()),
-                    (11, b"11".to_vec()),
-                    (13, b"13".to_vec()),
-                    (15, b"15".to_vec())
-                ]
-            );
-
-            Ok(())
-        }
-
-        #[test]
-        fn test_real_example_1() {
-            let test_dir = prepare_test_dir();
-
-            // 1GB
-            const PAGE_SIZE: u64 = 1024 * 1024 * 1024;
-
-            let mut zebo: Zebo<1_000_000, PAGE_SIZE, u32> =
-                Zebo::try_new(test_dir.clone()).unwrap();
-            assert_eq!(zebo.next_page_id, 0);
-
-            zebo.add_documents(vec![(
-                1,
-                MyDoc {
-                    id: "1".to_string(),
-                    text: r#"{"id"\:"1","text":"avvocata"}"#.to_string(),
-                },
-            )])
-            .unwrap();
-
-            let a = zebo.get_document(1).unwrap();
-            assert!(a.is_some());
-        }
-
-        #[test]
-        fn test_real_example_2() {
-            let test_dir = prepare_test_dir();
-
-            // 1GB
-            const PAGE_SIZE: u64 = 1024 * 1024 * 1024;
-
-            let mut zebo: Zebo<1_000_000, PAGE_SIZE, u32> =
-                Zebo::try_new(test_dir.clone()).unwrap();
-            assert_eq!(zebo.next_page_id, 0);
-
-            zebo.add_documents(vec![
-                (
-                    0,
-                    MyDoc {
-                        id: "1".to_string(),
-                        text: r#"{"id"\:"1","text":"foo"}"#.to_string(),
-                    },
-                ),
-                (
-                    1,
-                    MyDoc {
-                        id: "2".to_string(),
-                        text: r#"{"id"\:"1","text":"bar"}"#.to_string(),
-                    },
-                ),
-            ])
-            .unwrap();
-
-            let a = zebo.get_document(0).unwrap();
-            assert!(a.is_some());
-
-            let a = zebo.get_document(1).unwrap();
-            assert!(a.is_some());
-
-            zebo.remove_documents(vec![0], true).unwrap();
-        }
-
-        #[test]
-        fn test_real_example_3() {
-            let test_dir = prepare_test_dir();
-
-            // 1GB
-            const PAGE_SIZE: u64 = 1024 * 1024 * 1024;
-
-            let mut zebo = Zebo::<5, PAGE_SIZE, u64>::try_new(test_dir.clone())
-                .expect("Failed to create Zebo instance");
-
-            zebo.add_documents(vec![(
-                1,
-                MyDoc {
-                    id: "Document 1".to_string(),
-                    text: "This is the content of document 1.".to_string(),
-                },
-            )])
-            .expect("Failed to add documents");
-
-            let info_before = zebo.get_info().unwrap();
-            assert_eq!(info_before.page_headers.len(), 1);
-            drop(zebo);
-
-            let mut zebo = Zebo::<5, PAGE_SIZE, u64>::try_new(test_dir.clone())
-                .expect("Failed to create Zebo instance");
-
-            // Test realod of Zebo instance doesn't change the info
-            let info_after = zebo.get_info().unwrap();
-            assert_eq!(info_before, info_after);
-
-            zebo.add_documents(vec![(
-                4,
-                MyDoc {
-                    id: "Document 4".to_string(),
-                    text: "This is the content of document 4.".to_string(),
-                },
-            )])
-            .expect("Failed to add documents");
-
-            // Reload doesn't create a new page
-            let info = zebo.get_info().unwrap();
-            assert_eq!(info.page_headers.len(), 1);
-
-            drop(zebo);
-
-            let mut zebo = Zebo::<5, PAGE_SIZE, u64>::try_new(test_dir)
-                .expect("Failed to create Zebo instance");
-
-            zebo.add_documents(vec![(
-                5,
-                MyDoc {
-                    id: "Document 5".to_string(),
-                    text: "This is the content of document 5.".to_string(),
-                },
-            )])
-            .expect("Failed to add documents");
-
-            // Reload doesn't create a new page
-            let info = zebo.get_info().unwrap();
-            assert_eq!(info.page_headers.len(), 1);
-            let docs: Vec<_> = info
-                .page_headers
-                .into_iter()
-                .flat_map(|header| header.index.into_iter().map(|(doc_id, _, _)| doc_id))
-                .collect();
-            assert_eq!(docs, vec![1, 4, 5]);
-        }
-
-        #[test]
-        fn test_empty() {
-            let test_dir = prepare_test_dir();
-
-            // 1GB
-            const PAGE_SIZE: u64 = 1024 * 1024 * 1024;
-
-            let zebo = Zebo::<5, PAGE_SIZE, u64>::try_new(test_dir.clone())
-                .expect("Failed to create Zebo instance");
-
-            let info_before = zebo.get_info().unwrap();
-            assert_eq!(info_before.page_headers.len(), 0);
-            drop(zebo);
-
-            let zebo = Zebo::<5, PAGE_SIZE, u64>::try_new(test_dir.clone())
-                .expect("Failed to create Zebo instance");
-
-            // Test realod of Zebo instance doesn't change the info
-            let info_after = zebo.get_info().unwrap();
-            assert_eq!(info_before, info_after);
-        }
+        assert_eq!(zebo.get_document_count().unwrap(), 1);
     }
 
-    mod multi {
-        use super::*;
+    #[test]
+    fn test_zebo_concurrent() {
+        let test_dir = prepare_test_dir();
 
-        #[test]
-        fn test_add_multi_single_page() {
-            let test_dir = prepare_test_dir();
+        let mut zebo: Zebo<5, 2048, u32> = Zebo::<5, 2048, _>::try_new(test_dir.clone()).unwrap();
 
-            let mut zebo = Zebo::<5, 128, u64>::try_new(test_dir.clone())
-                .expect("Failed to create Zebo instance");
+        let docs1 = vec![(1, "Hello")];
+        let docs2 = vec![(2, "World")];
+        let space1 = zebo.reserve_space_for(&docs1).unwrap();
+        let space2 = zebo.reserve_space_for(&docs2).unwrap();
 
-            zebo.add_documents_batch(vec![(1, "foo"), (2, "barr")], 5, 5)
-                .unwrap();
+        // Drop Zebo instance
+        drop(zebo);
 
-            let output: Vec<_> = zebo
-                .get_documents(vec![1, 2])
-                .unwrap()
-                .collect::<Result<Vec<_>>>()
-                .unwrap();
-            let first = output.iter().find(|(id, _)| id == &1).unwrap();
-            let second = output.iter().find(|(id, _)| id == &2).unwrap();
+        space1.write_all().unwrap();
+        space2.write_all().unwrap();
 
-            assert_eq!(&first.1, "foo".as_bytes());
-            assert_eq!(&second.1, "barr".as_bytes());
+        let zebo: Zebo<5, 2048, u32> = Zebo::<5, 2048, _>::try_new(test_dir.clone()).unwrap();
 
-            let info = zebo.get_info().unwrap();
-            assert_eq!(info.page_headers.len(), 1);
-            assert_eq!(info.page_headers[0].document_count, 2);
+        let doc = zebo.get_document(1).unwrap().unwrap();
+        assert_eq!(doc, b"Hello");
+        let doc = zebo.get_document(2).unwrap().unwrap();
+        assert_eq!(doc, b"World");
+
+        let docs: Result<Vec<_>> = zebo.get_documents(vec![2, 1]).unwrap().collect();
+        let mut docs = docs.unwrap();
+        docs.sort_by_key(|(id, _)| *id);
+        assert_eq!(docs, vec![(1, b"Hello".to_vec()), (2, b"World".to_vec())]);
+
+        assert_eq!(zebo.get_document_count().unwrap(), 2);
+    }
+
+    #[test]
+    fn test_zebo_multi() {
+        let test_dir = prepare_test_dir();
+
+        let mut zebo: Zebo<5, 2048, u32> = Zebo::<5, 2048, _>::try_new(test_dir.clone()).unwrap();
+
+        let docs = vec![
+            (1, "Hello".to_string()),
+            (2, "World".to_string()),
+            (3, "This".to_string()),
+            (4, "Is".to_string()),
+            (5, "Zebo".to_string()),
+        ];
+        let space = zebo.reserve_space_for(&docs).unwrap();
+
+        // Drop Zebo instance
+        drop(zebo);
+
+        // I can write to file without having a reference to Zebo
+        space.write_all().unwrap();
+
+        let zebo: Zebo<5, 2048, u32> = Zebo::<5, 2048, _>::try_new(test_dir.clone()).unwrap();
+
+        for i in 1..=5 {
+            let expected = docs.iter().find(|(id, _)| *id == i).unwrap().1.as_bytes();
+            let doc = zebo.get_document(i).unwrap().unwrap();
+            assert_eq!(doc, expected);
+
+            let docs: Result<Vec<_>> = zebo.get_documents(vec![i]).unwrap().collect();
+            let docs = docs.unwrap();
+            assert_eq!(docs, vec![(i, expected.to_vec())]);
         }
 
-        #[test]
-        fn test_add_multi_exact_batch_size() {
-            let test_dir = prepare_test_dir();
+        let found_docs: Result<Vec<_>> = zebo.get_documents(vec![1, 2, 3, 4, 5]).unwrap().collect();
+        let mut found_docs = found_docs.unwrap();
+        found_docs.sort_by_key(|(id, _)| *id);
+        assert_eq!(
+            docs,
+            found_docs
+                .iter()
+                .map(|(id, text)| (*id, String::from_utf8(text.clone()).unwrap()))
+                .collect::<Vec<_>>()
+        );
 
-            let mut zebo = Zebo::<5, 128, u64>::try_new(test_dir.clone())
-                .expect("Failed to create Zebo instance");
+        assert_eq!(zebo.get_document_count().unwrap(), 5);
+    }
 
-            zebo.add_documents_batch(vec![(1, "foo"), (2, "barr")], 2, 5)
-                .unwrap();
+    #[test]
+    fn test_zebo_new_page() {
+        let test_dir = prepare_test_dir();
 
-            let output: Vec<_> = zebo
-                .get_documents(vec![1, 2])
-                .unwrap()
-                .collect::<Result<Vec<_>>>()
-                .unwrap();
-            let first = output.iter().find(|(id, _)| id == &1).unwrap();
-            let second = output.iter().find(|(id, _)| id == &2).unwrap();
+        let mut zebo: Zebo<5, 2048, u32> = Zebo::<5, 2048, _>::try_new(test_dir.clone()).unwrap();
 
-            assert_eq!(&first.1, "foo".as_bytes());
-            assert_eq!(&second.1, "barr".as_bytes());
+        let docs1 = vec![
+            (1, "Hello".to_string()),
+            (2, "World".to_string()),
+            (3, "This".to_string()),
+            (4, "Is".to_string()),
+        ];
+        let docs2 = vec![
+            (5, "Zebo".to_string()),
+            (6, "New".to_string()),
+            (7, "Page".to_string()),
+        ];
+        let space1 = zebo.reserve_space_for(&docs1).unwrap();
+        let space2 = zebo.reserve_space_for(&docs2).unwrap();
 
-            let info = zebo.get_info().unwrap();
-            assert_eq!(info.page_headers.len(), 1);
-            assert_eq!(info.page_headers[0].document_count, 2);
+        drop(zebo);
+
+        space1.write_all().unwrap();
+        space2.write_all().unwrap();
+
+        let zebo: Zebo<5, 2048, u32> = Zebo::<5, 2048, _>::try_new(test_dir.clone()).unwrap();
+
+        for i in 1..=7 {
+            let docs = if i > 4 { &docs2 } else { &docs1 };
+            let expected = docs.iter().find(|(id, _)| *id == i).unwrap().1.as_bytes();
+            let doc = zebo.get_document(i).unwrap().unwrap();
+            assert_eq!(doc, expected);
+
+            let docs: Result<Vec<_>> = zebo.get_documents(vec![i]).unwrap().collect();
+            let docs = docs.unwrap();
+            assert_eq!(docs, vec![(i, expected.to_vec())]);
         }
 
-        #[test]
-        fn test_add_multi_paged_1() {
-            let test_dir = prepare_test_dir();
+        let found_docs: Result<Vec<_>> = zebo
+            .get_documents(vec![1, 2, 3, 4, 5, 6, 7])
+            .unwrap()
+            .collect();
+        let mut found_docs = found_docs.unwrap();
+        found_docs.sort_by_key(|(id, _)| *id);
+        assert_eq!(
+            docs1
+                .into_iter()
+                .chain(docs2.into_iter())
+                .collect::<Vec<_>>(),
+            found_docs
+                .iter()
+                .map(|(id, text)| (*id, String::from_utf8(text.clone()).unwrap()))
+                .collect::<Vec<_>>()
+        );
 
-            let mut zebo = Zebo::<4, 128, u64>::try_new(test_dir.clone())
-                .expect("Failed to create Zebo instance");
+        assert_eq!(zebo.get_document_count().unwrap(), 7);
+    }
 
-            zebo.add_documents_batch(
-                vec![
-                    (1, "text 1"),
-                    (2, "text 2"),
-                    (3, "text 3"),
-                    (4, "text 4"),
-                    (5, "text 5"),
-                    (6, "text 6"),
-                ],
-                2,
-                5,
-            )
+    #[test]
+    fn test_zebo_empty_docs() {
+        let test_dir = prepare_test_dir();
+
+        let mut zebo: Zebo<5, 2048, u32> = Zebo::<5, 2048, _>::try_new(test_dir.clone()).unwrap();
+
+        let docs1 = vec![(1, "".to_string()), (2, "".to_string())];
+        let space1 = zebo.reserve_space_for(&docs1).unwrap();
+
+        drop(zebo);
+
+        space1.write_all().unwrap();
+
+        let zebo: Zebo<5, 2048, u32> = Zebo::<5, 2048, _>::try_new(test_dir.clone()).unwrap();
+
+        for i in 1..=2 {
+            let expected = docs1.iter().find(|(id, _)| *id == i).unwrap().1.as_bytes();
+            let doc = zebo.get_document(i).unwrap().unwrap();
+            assert_eq!(doc, expected);
+
+            let docs: Result<Vec<_>> = zebo.get_documents(vec![i]).unwrap().collect();
+            let docs = docs.unwrap();
+            assert_eq!(docs, vec![(i, expected.to_vec())]);
+        }
+
+        let found_docs: Result<Vec<_>> = zebo.get_documents(vec![1, 2]).unwrap().collect();
+        let mut found_docs = found_docs.unwrap();
+        found_docs.sort_by_key(|(id, _)| *id);
+        assert_eq!(
+            docs1.into_iter().collect::<Vec<_>>(),
+            found_docs
+                .iter()
+                .map(|(id, text)| (*id, String::from_utf8(text.clone()).unwrap()))
+                .collect::<Vec<_>>()
+        );
+
+        assert_eq!(zebo.get_document_count().unwrap(), 2);
+    }
+
+    #[test]
+    fn test_zebo_delete() {
+        let test_dir = prepare_test_dir();
+
+        let mut zebo: Zebo<5, 2048, u32> = Zebo::<5, 2048, _>::try_new(test_dir.clone()).unwrap();
+
+        let docs = vec![
+            (1, "01234567890".to_string()),
+            (2, "ABCFE".to_string()),
+            (3, "FGHIL".to_string()),
+        ];
+        zebo.reserve_space_for(&docs).unwrap().write_all().unwrap();
+
+        let info = zebo.get_info().unwrap();
+        assert_eq!(info.document_count, 3);
+
+        zebo.remove_documents(vec![1, 2], true).unwrap();
+
+        let err = zebo.get_document(1).unwrap();
+        assert!(err.is_none());
+        let err = zebo.get_document(2).unwrap();
+        assert!(err.is_none());
+        let doc = zebo.get_document(3).unwrap().unwrap();
+        assert_eq!(doc, b"FGHIL");
+
+        // Ignore unknown document
+        zebo.remove_documents(vec![55], true).unwrap();
+
+        let err = zebo.get_document(1).unwrap();
+        assert!(err.is_none());
+        let err = zebo.get_document(2).unwrap();
+        assert!(err.is_none());
+        let doc = zebo.get_document(3).unwrap().unwrap();
+        assert_eq!(doc, b"FGHIL");
+
+        // Ignore already deleted document
+        zebo.remove_documents(vec![1, 2], true).unwrap();
+
+        let err = zebo.get_document(1).unwrap();
+        assert!(err.is_none());
+        let err = zebo.get_document(2).unwrap();
+        assert!(err.is_none());
+        let doc = zebo.get_document(3).unwrap().unwrap();
+        assert_eq!(doc, b"FGHIL");
+
+        let info = zebo.get_info().unwrap();
+        assert_eq!(info.document_count, 1);
+
+        let docs = vec![
+            (4, "MNOP".to_string()),
+            (5, "QRTU".to_string()),
+            (6, "VWXYZ".to_string()),
+        ];
+        zebo.reserve_space_for(&docs).unwrap().write_all().unwrap();
+
+        let mut docs: Vec<_> = zebo
+            .get_documents([1, 2, 3, 4, 5, 6])
+            .unwrap()
+            .collect::<Result<Vec<_>>>()
+            .unwrap();
+        docs.sort_by_key(|(id, _)| *id);
+        assert_eq!(
+            docs,
+            vec![
+                (3, b"FGHIL".to_vec()),
+                (4, b"MNOP".to_vec()),
+                (5, b"QRTU".to_vec()),
+                (6, b"VWXYZ".to_vec()),
+            ]
+        );
+
+        assert_eq!(zebo.get_document_count().unwrap(), 4);
+    }
+
+    #[test]
+    fn test_zebo_get_all_documents() {
+        let test_dir = prepare_test_dir();
+
+        let mut zebo: Zebo<3, 2048, u32> = Zebo::<3, 2048, _>::try_new(test_dir.clone()).unwrap();
+
+        zebo.reserve_space_for(&[(1, "first"), (2, "second"), (3, "third")])
+            .unwrap()
+            .write_all()
+            .unwrap();
+        zebo.reserve_space_for(&[(4, "fourth"), (5, "fifth"), (6, "sixth")])
+            .unwrap()
+            .write_all()
             .unwrap();
 
-            let output: Vec<_> = zebo
-                .get_documents(vec![1, 2, 3, 4, 5, 6])
-                .unwrap()
-                .collect::<Result<Vec<_>>>()
-                .unwrap();
-
-            let docs: Vec<_> = (1..=6)
-                .map(|i| output.iter().find(|(id, _)| id == &i).unwrap().clone())
-                .collect();
-            assert_eq!(
-                &docs,
-                &[
-                    (1_u64, "text 1".as_bytes().to_vec()),
-                    (2_u64, "text 2".as_bytes().to_vec()),
-                    (3_u64, "text 3".as_bytes().to_vec()),
-                    (4_u64, "text 4".as_bytes().to_vec()),
-                    (5_u64, "text 5".as_bytes().to_vec()),
-                    (6_u64, "text 6".as_bytes().to_vec())
-                ]
-            );
-
-            let info = zebo.get_info().unwrap();
-            assert_eq!(info.page_headers.len(), 2);
-            assert_eq!(info.page_headers[0].document_count, 4);
-            assert_eq!(info.page_headers[1].document_count, 2);
-        }
-
-        #[test]
-        fn test_add_multi_paged2() {
-            let test_dir = prepare_test_dir();
-
-            let mut zebo = Zebo::<2, 128, u64>::try_new(test_dir.clone())
-                .expect("Failed to create Zebo instance");
-
-            zebo.add_documents_batch(
-                vec![
-                    (1, "text 1"),
-                    (2, "text 2"),
-                    (3, "text 3"),
-                    (4, "text 4"),
-                    (5, "text 5"),
-                    (6, "text 6"),
-                ],
-                2,
-                5,
-            )
+        // Get all documents and verify they're all returned
+        let mut all_docs = zebo
+            .get_all_documents()
+            .unwrap()
+            .collect::<Result<Vec<_>>>()
             .unwrap();
 
-            let output: Vec<_> = zebo
-                .get_documents(vec![1, 2, 3, 4, 5, 6])
-                .unwrap()
-                .collect::<Result<Vec<_>>>()
-                .unwrap();
+        // Sort for comparison since order is not guaranteed
+        all_docs.sort_by_key(|d| d.0);
 
-            let docs: Vec<_> = (1..=6)
-                .map(|i| output.iter().find(|(id, _)| id == &i).unwrap().clone())
-                .collect();
-            assert_eq!(
-                &docs,
-                &[
-                    (1_u64, "text 1".as_bytes().to_vec()),
-                    (2_u64, "text 2".as_bytes().to_vec()),
-                    (3_u64, "text 3".as_bytes().to_vec()),
-                    (4_u64, "text 4".as_bytes().to_vec()),
-                    (5_u64, "text 5".as_bytes().to_vec()),
-                    (6_u64, "text 6".as_bytes().to_vec())
-                ]
-            );
+        assert_eq!(all_docs.len(), 6);
+        assert_eq!(
+            all_docs,
+            vec![
+                (1, b"first".to_vec()),
+                (2, b"second".to_vec()),
+                (3, b"third".to_vec()),
+                (4, b"fourth".to_vec()),
+                (5, b"fifth".to_vec()),
+                (6, b"sixth".to_vec()),
+            ]
+        );
 
-            let info = zebo.get_info().unwrap();
-            assert_eq!(info.page_headers.len(), 3);
-            assert_eq!(info.page_headers[0].document_count, 2);
-            assert_eq!(info.page_headers[1].document_count, 2);
-            assert_eq!(info.page_headers[2].document_count, 2);
-        }
+        // Test with empty storage
+        let test_dir_empty = prepare_test_dir();
+        let zebo_empty: Zebo<2, 2048, u32> = Zebo::<2, 2048, _>::try_new(test_dir_empty).unwrap();
+
+        let empty_docs: Vec<_> = zebo_empty
+            .get_all_documents()
+            .unwrap()
+            .collect::<Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(empty_docs.len(), 0);
+    }
+
+    #[test]
+    fn test_zebo_get_all_documents_with_deletions() {
+        let test_dir = prepare_test_dir();
+
+        let mut zebo: Zebo<5, 2048, u32> = Zebo::<5, 2048, _>::try_new(test_dir.clone()).unwrap();
+
+        zebo.reserve_space_for(&[(1, "first"), (2, "second"), (3, "third"), (4, "fourth")])
+            .unwrap()
+            .write_all()
+            .unwrap();
+
+        // Remove some documents
+        zebo.remove_documents(vec![2, 4], true).unwrap();
+
+        let mut remaining_docs = zebo
+            .get_all_documents()
+            .unwrap()
+            .collect::<Result<Vec<_>>>()
+            .unwrap();
+        remaining_docs.sort_by_key(|d| d.0);
+
+        assert_eq!(remaining_docs.len(), 2);
+        assert_eq!(
+            remaining_docs,
+            vec![(1, b"first".to_vec()), (3, b"third".to_vec()),]
+        );
+    }
+
+    #[test]
+    fn test_zebo_with_gap() -> Result<()> {
+        let test_dir = prepare_test_dir();
+
+        let mut zebo: Zebo<4, 2048, u32> = Zebo::try_new(test_dir.clone()).unwrap();
+        assert_eq!(zebo.next_page_id, 0);
+
+        zebo.reserve_space_for(&[(1, "1"), (3, "3"), (5, "5")])
+            .unwrap()
+            .write_all()
+            .unwrap();
+        zebo.reserve_space_for(&[(7, "7"), (9, "9"), (11, "11")])
+            .unwrap()
+            .write_all()
+            .unwrap();
+
+        let info = zebo.get_info().unwrap();
+        assert_eq!(info.document_count, 6);
+
+        let output: Result<Vec<_>> = zebo
+            .get_documents(vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12])
+            .unwrap()
+            .collect();
+        let mut output = output.unwrap();
+        output.sort_by_key(|d| d.0);
+
+        let info = zebo.get_info().unwrap();
+        assert_eq!(info.page_headers.len(), 2);
+
+        let docs = zebo
+            .get_documents(vec![1, 3, 5, 6])
+            .unwrap()
+            .collect::<Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(docs.len(), 3);
+
+        let removed = zebo.remove_documents(vec![1, 2, 3, 4, 5], false).unwrap();
+        assert_eq!(removed, 3);
+
+        let docs = zebo
+            .get_documents(vec![1, 3, 5, 6])
+            .unwrap()
+            .collect::<Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(docs.len(), 0);
+
+        let info = zebo.get_info().unwrap();
+        assert_eq!(info.document_count, 3);
+
+        zebo.reserve_space_for(&[(13, "13"), (15, "15")])
+            .unwrap()
+            .write_all()
+            .unwrap();
+
+        let info = zebo.get_info().unwrap();
+        assert_eq!(info.document_count, 5);
+
+        let mut docs = zebo
+            .get_documents(vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16])
+            .unwrap()
+            .collect::<Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(docs.len(), 5);
+        docs.sort_by_key(|d| d.0);
+        assert_eq!(
+            docs,
+            vec![
+                (7, b"7".to_vec()),
+                (9, b"9".to_vec()),
+                (11, b"11".to_vec()),
+                (13, b"13".to_vec()),
+                (15, b"15".to_vec())
+            ]
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_real_example_3() {
+        let test_dir = prepare_test_dir();
+
+        // 1GB
+        const PAGE_SIZE: u64 = 1024 * 1024 * 1024;
+
+        let mut zebo = Zebo::<5, PAGE_SIZE, u64>::try_new(test_dir.clone())
+            .expect("Failed to create Zebo instance");
+
+        zebo.reserve_space_for(&[(
+            1,
+            MyDoc {
+                id: "Document 1".to_string(),
+                text: "This is the content of document 1.".to_string(),
+            },
+        )])
+        .unwrap()
+        .write_all()
+        .unwrap();
+
+        let info_before = zebo.get_info().unwrap();
+        assert_eq!(info_before.page_headers.len(), 1);
+        drop(zebo);
+
+        let mut zebo = Zebo::<5, PAGE_SIZE, u64>::try_new(test_dir.clone())
+            .expect("Failed to create Zebo instance");
+
+        // Test realod of Zebo instance doesn't change the info
+        let info_after = zebo.get_info().unwrap();
+        assert_eq!(info_before, info_after);
+
+        zebo.reserve_space_for(&[(
+            4,
+            MyDoc {
+                id: "Document 4".to_string(),
+                text: "This is the content of document 4.".to_string(),
+            },
+        )])
+        .unwrap()
+        .write_all()
+        .unwrap();
+
+        // Reload doesn't create a new page
+        let info = zebo.get_info().unwrap();
+        assert_eq!(info.page_headers.len(), 1);
+
+        drop(zebo);
+
+        let mut zebo =
+            Zebo::<5, PAGE_SIZE, u64>::try_new(test_dir).expect("Failed to create Zebo instance");
+
+        zebo.reserve_space_for(&[(
+            5,
+            MyDoc {
+                id: "Document 5".to_string(),
+                text: "This is the content of document 5.".to_string(),
+            },
+        )])
+        .unwrap()
+        .write_all()
+        .unwrap();
+
+        // Reload doesn't create a new page
+        let info = zebo.get_info().unwrap();
+        assert_eq!(info.page_headers.len(), 1);
+        let docs: Vec<_> = info
+            .page_headers
+            .into_iter()
+            .flat_map(|header| header.index.into_iter().map(|(doc_id, _, _)| doc_id))
+            .collect();
+        assert_eq!(docs, vec![1, 4, 5]);
+    }
+
+    #[test]
+    fn test_empty() {
+        let test_dir = prepare_test_dir();
+
+        // 1GB
+        const PAGE_SIZE: u64 = 1024 * 1024 * 1024;
+
+        let zebo = Zebo::<5, PAGE_SIZE, u64>::try_new(test_dir.clone())
+            .expect("Failed to create Zebo instance");
+
+        let info_before = zebo.get_info().unwrap();
+        assert_eq!(info_before.page_headers.len(), 0);
+        drop(zebo);
+
+        let zebo = Zebo::<5, PAGE_SIZE, u64>::try_new(test_dir.clone())
+            .expect("Failed to create Zebo instance");
+
+        // Test realod of Zebo instance doesn't change the info
+        let info_after = zebo.get_info().unwrap();
+        assert_eq!(info_before, info_after);
     }
 
     #[test]
     fn test_add_mized() {
         let test_dir = prepare_test_dir();
 
-        let mut zebo =
-            Zebo::<2, 128, u64>::try_new(test_dir.clone()).expect("Failed to create Zebo instance");
+        let mut zebo = Zebo::<10, 128, u64>::try_new(test_dir.clone())
+            .expect("Failed to create Zebo instance");
 
-        zebo.add_documents_batch(
-            vec![
-                (1, "text 1"),
-                (2, "text 2"),
-                (3, "text 3"),
-                (4, "text 4"),
-                (5, "text 5"),
-                (6, "text 6"),
-            ],
-            2,
-            5,
-        )
+        zebo.reserve_space_for(&[
+            (1, "text 1"),
+            (2, "text 2"),
+            (3, "text 3"),
+            (4, "text 4"),
+            (5, "text 5"),
+            (6, "text 6"),
+        ])
+        .unwrap()
+        .write_all()
         .unwrap();
 
-        zebo.add_documents(vec![(7, "text 7")]).unwrap();
+        zebo.reserve_space_for(&[(7, "text 7")])
+            .unwrap()
+            .write_all()
+            .unwrap();
 
-        let output: Vec<_> = zebo
+        let mut output: Vec<_> = zebo
             .get_documents(vec![1, 2, 3, 4, 5, 6, 7])
             .unwrap()
             .collect::<Result<Vec<_>>>()
             .unwrap();
+        output.sort_by_key(|(id, _)| *id);
 
-        let docs: Vec<_> = (1..=7)
-            .map(|i| output.iter().find(|(id, _)| id == &i).unwrap().clone())
-            .collect();
         assert_eq!(
-            &docs,
+            &output,
             &[
                 (1_u64, "text 1".as_bytes().to_vec()),
                 (2_u64, "text 2".as_bytes().to_vec()),
@@ -1502,12 +1135,75 @@ mod tests {
             ]
         );
 
+        zebo.reserve_space_for(&[
+            (8, "text 8"),
+            (9, "text 9"),
+            (10, "text 10"),
+            (11, "text 11"),
+            (12, "text 12"),
+            (13, "text 13"),
+        ])
+        .unwrap()
+        .write_all()
+        .unwrap();
+
         let info = zebo.get_info().unwrap();
-        assert_eq!(info.page_headers.len(), 4);
-        assert_eq!(info.page_headers[0].document_count, 2);
-        assert_eq!(info.page_headers[1].document_count, 2);
-        assert_eq!(info.page_headers[2].document_count, 2);
-        assert_eq!(info.page_headers[3].document_count, 1);
+        assert_eq!(info.page_headers.len(), 2);
+        assert_eq!(info.page_headers[0].document_count, 7);
+        assert_eq!(info.page_headers[1].document_count, 6);
+    }
+
+    #[test]
+    fn test_get_all_pages() {
+        let test_dir = prepare_test_dir();
+
+        let mut zebo = Zebo::<10, 128, u64>::try_new(test_dir.clone())
+            .expect("Failed to create Zebo instance");
+
+        zebo.reserve_space_for(&[
+            (1, "text 1"),
+            (2, "text 2"),
+            (3, "text 3"),
+            (4, "text 4"),
+            (5, "text 5"),
+            (6, "text 6"),
+        ])
+        .unwrap()
+        .write_all()
+        .unwrap();
+
+        zebo.reserve_space_for(&[(7, "text 7")])
+            .unwrap()
+            .write_all()
+            .unwrap();
+
+        zebo.reserve_space_for(&[
+            (8, "text 8"),
+            (9, "text 9"),
+            (10, "text 10"),
+            (11, "text 11"),
+            (12, "text 12"),
+            (13, "text 13"),
+        ])
+        .unwrap()
+        .write_all()
+        .unwrap();
+
+        let pages = zebo.get_all_pages().unwrap();
+        assert_eq!(pages, vec![(1, PageId(0)), (8, PageId(1))]);
+    }
+
+    #[test]
+    fn test_not_enough_max_doc_per_page() {
+        let test_dir = prepare_test_dir();
+
+        let mut zebo =
+            Zebo::<1, 128, u64>::try_new(test_dir.clone()).expect("Failed to create Zebo instance");
+
+        let output = zebo.reserve_space_for(&[(1, "text 1"), (2, "text 2")]);
+
+        let err = output.unwrap_err();
+        assert!(matches!(err, ZeboError::TooManyDocuments { .. }));
     }
 
     struct MyDoc {
@@ -1520,6 +1216,10 @@ mod tests {
             v.extend(self.id.as_bytes());
             v.extend(ZERO);
             v.extend(self.text.as_bytes());
+        }
+
+        fn len(&self) -> usize {
+            self.id.len() + 1 + self.text.len()
         }
     }
 }

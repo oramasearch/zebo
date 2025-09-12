@@ -31,12 +31,19 @@ pub enum ZeboError {
     },
     OperationError(std::io::Error),
     UnexpectedPageId,
+    TooManyDocuments {
+        max: u32,
+        got: u32,
+    },
 }
 impl Display for ZeboError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             ZeboError::UnsupportedVersion { version, wanted } => {
                 write!(f, "Unsupported version: {version}. Wanted: {wanted}")
+            }
+            ZeboError::TooManyDocuments { max, got } => {
+                write!(f, "Too many documents: got {got}, max is {max}")
             }
             ZeboError::CannotCreateBaseDir {
                 inner_error,

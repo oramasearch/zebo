@@ -1,5 +1,10 @@
 /target
 zebo_test
 zebo_data_dir
+zebo_data_dir_perf
+zebo_data_dir_reload
+zebo_data_dir_simple
+my-folder
+
 zebo-*.tar.gz
 .data
