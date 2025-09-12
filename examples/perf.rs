@@ -28,6 +28,10 @@ impl zebo::Document for Document {
         v.extend(ZERO);
         v.extend(self.data.as_bytes());
     }
+
+    fn len(&self) -> usize {
+        self.id.len() + 1 + self.data.len()
+    }
 }
 
 // 1 GB
@@ -38,7 +42,7 @@ fn main() {
     const LEN: usize = 64_000;
 
     // Prepare docs
-    let docs_single: Vec<_> = (0..LEN)
+    let docs: Vec<_> = (0..LEN)
         .map(|i| {
             (
                 DocumentId(1),
@@ -49,34 +53,21 @@ fn main() {
             )
         })
         .collect();
-    let docs_multi = docs_single.clone();
 
     // Run single
 
     println!("Run single");
-    let data_dir = "./zebo_data_dir/perf/1/single";
+    let data_dir = "./zebo_data_dir_perf";
     let _ = std::fs::remove_dir_all(data_dir);
     std::fs::create_dir_all(data_dir).unwrap();
     let mut zebo = Zebo::<MAX_DOC_PER_PAGE, PAGE_SIZE, DocumentId>::try_new(data_dir)
         .expect("Failed to create Zebo instance");
     let start = Instant::now();
 
-    zebo.add_documents(docs_single)
-        .expect("Failed to add documents");
-    println!("Elapsed {:?}", start.elapsed());
-    drop(zebo);
-
-    // Run multi
-
-    println!("Run multi");
-    let data_dir = "./zebo_data_dir/perf/1/multi";
-    let _ = std::fs::remove_dir_all(data_dir);
-    std::fs::create_dir_all(data_dir).unwrap();
-    let mut zebo = Zebo::<MAX_DOC_PER_PAGE, PAGE_SIZE, DocumentId>::try_new(data_dir)
-        .expect("Failed to create Zebo instance");
-    let start = Instant::now();
-    zebo.add_documents_batch(docs_multi, 200, 512)
-        .expect("Failed to add documents");
+    zebo.reserve_space_for(&docs)
+        .expect("Failed to add documents")
+        .write_all()
+        .expect("Failed to write all documents");
     println!("Elapsed {:?}", start.elapsed());
     drop(zebo);
 }

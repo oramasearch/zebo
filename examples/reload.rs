@@ -25,24 +25,30 @@ impl zebo::Document for Document {
         v.extend(ZERO);
         v.extend(self.data.as_bytes());
     }
+
+    fn len(&self) -> usize {
+        self.id.len() + 1 + self.data.len()
+    }
 }
 
 // 1 GB
 static PAGE_SIZE: u64 = 1024 * 5;
 
 fn main() {
-    let data_dir = "./zebo_data_dir";
+    let data_dir = "./zebo_data_dir_reload";
     let mut zebo = Zebo::<5, PAGE_SIZE, DocumentId>::try_new(data_dir)
         .expect("Failed to create Zebo instance");
 
-    zebo.add_documents(vec![(
+    zebo.reserve_space_for(&[(
         DocumentId(1),
         Document {
             id: "Document 1".to_string(),
             data: "This is the content of document 1.".to_string(),
         },
     )])
-    .expect("Failed to add documents");
+    .expect("Failed to add documents")
+    .write_all()
+    .expect("Failed to write documents");
 
     let info_before = zebo.get_info().unwrap();
     drop(zebo);
@@ -53,14 +59,16 @@ fn main() {
     let info_after = zebo.get_info().unwrap();
     assert_eq!(info_before, info_after);
 
-    zebo.add_documents(vec![(
+    zebo.reserve_space_for(&[(
         DocumentId(4),
         Document {
             id: "Document 4".to_string(),
             data: "This is the content of document 4.".to_string(),
         },
     )])
-    .expect("Failed to add documents");
+    .expect("Failed to add documents")
+    .write_all()
+    .expect("Failed to write documents");
 
     let info = zebo.get_info();
     println!("Zebo Info: {info:#?}");
@@ -69,14 +77,16 @@ fn main() {
     let mut zebo = Zebo::<5, PAGE_SIZE, DocumentId>::try_new(data_dir)
         .expect("Failed to create Zebo instance");
 
-    zebo.add_documents(vec![(
+    zebo.reserve_space_for(&[(
         DocumentId(5),
         Document {
             id: "Document 5".to_string(),
             data: "This is the content of document 5.".to_string(),
         },
     )])
-    .expect("Failed to add documents");
+    .expect("Failed to add documents")
+    .write_all()
+    .expect("Failed to write documents");
 
     let info = zebo.get_info();
     println!("Zebo Info: {info:#?}");
