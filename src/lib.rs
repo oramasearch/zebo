@@ -1,4 +1,4 @@
-#![feature(coverage_attribute)]
+#![cfg_attr(coverage_nightly, feature(coverage_attribute))]
 #![allow(clippy::test_attr_in_doctest)]
 #![allow(clippy::needless_doctest_main)]
 #![doc = include_str!("../README.md")]
