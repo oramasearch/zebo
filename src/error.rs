@@ -35,12 +35,16 @@ pub enum ZeboError {
         max: u32,
         got: u32,
     },
+    NoDocToAdd,
 }
 impl Display for ZeboError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             ZeboError::UnsupportedVersion { version, wanted } => {
                 write!(f, "Unsupported version: {version}. Wanted: {wanted}")
+            }
+            ZeboError::NoDocToAdd => {
+                write!(f, "No document to add")
             }
             ZeboError::TooManyDocuments { max, got } => {
                 write!(f, "Too many documents: got {got}, max is {max}")

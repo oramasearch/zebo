@@ -127,6 +127,9 @@ impl<const MAX_DOC_PER_PAGE: u32, const PAGE_SIZE: u64, DocId: DocumentId>
                 got: document_count,
             });
         }
+        if docs.len() == 0 {
+            return Err(ZeboError::NoDocToAdd);
+        }
 
         if let Some((_, page)) = self.current_page.as_mut() {
             let total_document_count_in_page = page.next_available_header_offset;
