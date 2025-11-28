@@ -127,7 +127,7 @@ impl<const MAX_DOC_PER_PAGE: u32, const PAGE_SIZE: u64, DocId: DocumentId>
                 got: document_count,
             });
         }
-        if docs.len() == 0 {
+        if docs.is_empty() {
             return Err(ZeboError::NoDocToAdd);
         }
 

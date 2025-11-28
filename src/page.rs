@@ -1,6 +1,6 @@
 use std::{fs::File, io::Write, os::unix::fs::FileExt};
 
-use tracing::{debug, error, instrument};
+use tracing::{debug, error, instrument, trace};
 
 use crate::{Document, DocumentId, Result, Version, ZeboError, index::ProbableIndex};
 
@@ -241,6 +241,8 @@ impl ZeboPage {
         &self,
         doc_id_with_index: &[(u64, ProbableIndex)],
     ) -> Result<Vec<(DocId, Vec<u8>)>> {
+        trace!("Getting documents: {:?}", doc_id_with_index);
+
         let mut r = Vec::with_capacity(doc_id_with_index.len());
 
         for (doc_id, probable_index) in doc_id_with_index {
@@ -730,7 +732,8 @@ impl ZeboPage {
 
     fn find_from_start(&self, target_doc_id: u64) -> Result<Option<(u64, u32, u32)>> {
         let mut buf = [0; 16];
-        for i in 0..=1179623 {
+        let mut i = 0;
+        loop {
             match self
                 .page_file
                 .read_exact_at(&mut buf, DOCUMENT_INDEX_OFFSET + (i * (4 + 4 + 8)))
@@ -759,6 +762,7 @@ impl ZeboPage {
                     return Err(ZeboError::OperationError(e));
                 }
             }
+            i += 1;
         }
 
         Ok(None)
