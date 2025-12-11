@@ -196,6 +196,38 @@ impl ZeboPage {
         document_offset == 0
     }
 
+    /// Returns the maximum document ID in this page, including deleted documents.
+    /// Returns None if no documents have ever been added to this page.
+    pub fn get_max_document_id(&self) -> Result<Option<u64>> {
+        let mut max_doc_id: Option<u64> = None;
+
+        for i in 0..self.document_limit {
+            if let Some((doc_id, offset, _len)) = self.get_at(i as u64)? {
+                // Skip uninitialized entries
+                if Self::is_uninitialized_entry(offset) {
+                    continue;
+                }
+
+                // Skip old-format deletions (doc_id = u64::MAX)
+                // but include new-format deletions (preserved doc_id)
+                if doc_id == u64::MAX {
+                    continue;
+                }
+
+                match max_doc_id {
+                    None => max_doc_id = Some(doc_id),
+                    Some(current_max) => {
+                        if doc_id > current_max {
+                            max_doc_id = Some(doc_id);
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(max_doc_id)
+    }
+
     pub fn get_header(&self) -> Result<ZeboPageHeader> {
         let document_count = self.get_document_count()?;
         let next_available_document_offset = self.get_next_available_document_offset()?;
@@ -232,6 +264,7 @@ impl ZeboPage {
             next_available_document_offset,
             next_available_header_offset: self.next_available_header_offset,
             index: doc_index,
+            starting_document_id: self.starting_document_id,
         };
 
         Ok(header)
@@ -1037,6 +1070,7 @@ pub struct ZeboPageHeader {
     pub next_available_document_offset: u32,
     pub next_available_header_offset: u32,
     pub index: Vec<(u64, u32, u32)>,
+    pub starting_document_id: u64,
 }
 
 #[cfg(test)]

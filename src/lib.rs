@@ -186,6 +186,32 @@ impl<const MAX_DOC_PER_PAGE: u32, const PAGE_SIZE: u64, DocId: DocumentId>
         })
     }
 
+    /// Returns the highest document ID that was ever inserted, regardless of deletion status.
+    ///
+    /// This method returns the maximum document ID across all pages, including documents
+    /// that have been deleted. It is useful for determining the ID range or the next
+    /// available ID for new documents.
+    ///
+    /// # Returns
+    /// - `Ok(None)` if no documents have ever been inserted
+    /// - `Ok(Some(id))` with the highest document ID, even if that document is deleted
+    pub fn get_last_inserted_document_id(&self) -> Result<Option<DocId>> {
+        let mut page_ids = self.index.get_page_ids()?;
+        page_ids.sort();
+        page_ids.reverse();
+
+        // Iterate through pages from highest to lowest to find the maximum document ID
+        for page_id in page_ids {
+            let page = load_page(&self.base_dir, page_id, Mode::Read)?;
+            if let Some(max_id) = page.get_max_document_id()? {
+                return Ok(Some(DocId::from_u64(max_id)));
+            }
+        }
+
+        // No documents found in any page
+        Ok(None)
+    }
+
     /// Returns the document associated to the given id
     pub fn get_document(&self, doc_id: DocId) -> Result<Option<Vec<u8>>> {
         let output = self.get_documents(vec![doc_id])?.next();
@@ -1207,6 +1233,177 @@ mod tests {
 
         let err = output.unwrap_err();
         assert!(matches!(err, ZeboError::TooManyDocuments { .. }));
+    }
+
+    #[test]
+    fn test_get_last_inserted_document_id_empty() {
+        let test_dir = prepare_test_dir();
+        let zebo: Zebo<5, 2048, u32> = Zebo::<5, 2048, _>::try_new(test_dir).unwrap();
+
+        let result = zebo.get_last_inserted_document_id().unwrap();
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn test_get_last_inserted_document_id_single_document() {
+        let test_dir = prepare_test_dir();
+        let mut zebo: Zebo<5, 2048, u32> = Zebo::<5, 2048, _>::try_new(test_dir).unwrap();
+
+        zebo.reserve_space_for(&[(42, "test")])
+            .unwrap()
+            .write_all()
+            .unwrap();
+
+        let result = zebo.get_last_inserted_document_id().unwrap();
+        assert_eq!(result, Some(42));
+    }
+
+    #[test]
+    fn test_get_last_inserted_document_id_multiple_pages() {
+        let test_dir = prepare_test_dir();
+        let mut zebo: Zebo<3, 2048, u32> = Zebo::<3, 2048, _>::try_new(test_dir).unwrap();
+
+        zebo.reserve_space_for(&[(1, "a"), (2, "b"), (3, "c")])
+            .unwrap()
+            .write_all()
+            .unwrap();
+        zebo.reserve_space_for(&[(4, "d"), (5, "e"), (6, "f")])
+            .unwrap()
+            .write_all()
+            .unwrap();
+        zebo.reserve_space_for(&[(7, "g"), (8, "h"), (9, "i")])
+            .unwrap()
+            .write_all()
+            .unwrap();
+
+        let result = zebo.get_last_inserted_document_id().unwrap();
+        assert_eq!(result, Some(9));
+    }
+
+    #[test]
+    fn test_get_last_inserted_document_id_with_gaps() {
+        let test_dir = prepare_test_dir();
+        let mut zebo: Zebo<5, 2048, u32> = Zebo::<5, 2048, _>::try_new(test_dir).unwrap();
+
+        zebo.reserve_space_for(&[(1, "a"), (100, "b"), (500, "c"), (1000, "d")])
+            .unwrap()
+            .write_all()
+            .unwrap();
+
+        let result = zebo.get_last_inserted_document_id().unwrap();
+        assert_eq!(result, Some(1000));
+    }
+
+    #[test]
+    fn test_get_last_inserted_document_id_deleted_document() {
+        let test_dir = prepare_test_dir();
+        let mut zebo: Zebo<5, 2048, u32> = Zebo::<5, 2048, _>::try_new(test_dir).unwrap();
+
+        zebo.reserve_space_for(&[(1, "a"), (2, "b"), (3, "c"), (4, "d"), (5, "e")])
+            .unwrap()
+            .write_all()
+            .unwrap();
+
+        zebo.remove_documents(vec![5], true).unwrap();
+
+        // Verify document 5 is actually deleted
+        assert!(zebo.get_document(5).unwrap().is_none());
+
+        // Should still return 5 as the last inserted ID
+        let result = zebo.get_last_inserted_document_id().unwrap();
+        assert_eq!(result, Some(5));
+    }
+
+    #[test]
+    fn test_get_last_inserted_document_id_all_deleted() {
+        let test_dir = prepare_test_dir();
+        let mut zebo: Zebo<5, 2048, u32> = Zebo::<5, 2048, _>::try_new(test_dir).unwrap();
+
+        zebo.reserve_space_for(&[(1, "a"), (2, "b"), (3, "c")])
+            .unwrap()
+            .write_all()
+            .unwrap();
+
+        zebo.remove_documents(vec![1, 2, 3], true).unwrap();
+
+        let result = zebo.get_last_inserted_document_id().unwrap();
+        assert_eq!(result, Some(3));
+    }
+
+    #[test]
+    fn test_get_last_inserted_document_id_mixed_deleted_active() {
+        let test_dir = prepare_test_dir();
+        let mut zebo: Zebo<10, 2048, u32> = Zebo::<10, 2048, _>::try_new(test_dir).unwrap();
+
+        zebo.reserve_space_for(&[(1, "a"), (2, "b"), (3, "c"), (4, "d"), (5, "e"), (6, "f")])
+            .unwrap()
+            .write_all()
+            .unwrap();
+
+        zebo.remove_documents(vec![2, 4, 6], true).unwrap();
+
+        let result = zebo.get_last_inserted_document_id().unwrap();
+        assert_eq!(result, Some(6));
+    }
+
+    #[test]
+    fn test_get_last_inserted_document_id_persistence() {
+        let test_dir = prepare_test_dir();
+
+        {
+            let mut zebo: Zebo<5, 2048, u32> =
+                Zebo::<5, 2048, _>::try_new(test_dir.clone()).unwrap();
+            zebo.reserve_space_for(&[(1, "a"), (2, "b"), (3, "c")])
+                .unwrap()
+                .write_all()
+                .unwrap();
+        }
+
+        // Reload from disk
+        let zebo: Zebo<5, 2048, u32> = Zebo::<5, 2048, _>::try_new(test_dir).unwrap();
+        let result = zebo.get_last_inserted_document_id().unwrap();
+        assert_eq!(result, Some(3));
+    }
+
+    #[test]
+    fn test_get_last_inserted_document_id_after_add_delete_add() {
+        let test_dir = prepare_test_dir();
+        let mut zebo: Zebo<5, 2048, u32> = Zebo::<5, 2048, _>::try_new(test_dir).unwrap();
+
+        zebo.reserve_space_for(&[(1, "a"), (2, "b"), (3, "c")])
+            .unwrap()
+            .write_all()
+            .unwrap();
+
+        zebo.remove_documents(vec![3], true).unwrap();
+
+        zebo.reserve_space_for(&[(4, "d"), (5, "e")])
+            .unwrap()
+            .write_all()
+            .unwrap();
+
+        let result = zebo.get_last_inserted_document_id().unwrap();
+        assert_eq!(result, Some(5));
+    }
+
+    #[test]
+    fn test_get_last_inserted_document_id_multiple_pages_with_deletions() {
+        let test_dir = prepare_test_dir();
+        let mut zebo: Zebo<3, 2048, u32> = Zebo::<3, 2048, _>::try_new(test_dir).unwrap();
+
+        zebo.reserve_space_for(&[(1, "a"), (2, "b"), (3, "c")])
+            .unwrap()
+            .write_all()
+            .unwrap();
+        zebo.reserve_space_for(&[(4, "d"), (5, "e"), (6, "f")])
+            .unwrap()
+            .write_all()
+            .unwrap();
+
+        zebo.remove_documents(vec![5, 6], true).unwrap();
+
+        let result = zebo.get_last_inserted_document_id().unwrap();
+        assert_eq!(result, Some(6));
     }
 
     struct MyDoc {
