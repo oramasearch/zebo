@@ -1,4 +1,6 @@
-use std::{collections::HashMap, io::Write, os::unix::fs::FileExt, path::PathBuf};
+use std::{collections::HashMap, io::Write, path::PathBuf};
+
+use positioned_io::{ReadAt, WriteAt};
 
 use crate::{DocumentId, PageId, Result, Version, ZeboError};
 
@@ -16,7 +18,7 @@ impl<DocId: DocumentId> ZeboIndex<DocId> {
         std::fs::create_dir_all(&index_dir).map_err(ZeboError::OperationError)?;
 
         let index_file_path = index_dir.join("index.index");
-        let index_file = std::fs::OpenOptions::new()
+        let mut index_file = std::fs::OpenOptions::new()
             .read(true)
             .write(true)
             .create(true)
@@ -25,13 +27,13 @@ impl<DocId: DocumentId> ZeboIndex<DocId> {
             .map_err(ZeboError::OperationError)?;
 
         index_file
-            .write_all_at(&[Version::V1.into()], 0)
+            .write_all_at(0, &[Version::V1.into()])
             .map_err(ZeboError::OperationError)?;
 
         // offset as u64
         let initial_offset = 9_u64.to_be_bytes();
         index_file
-            .write_all_at(&initial_offset, 1)
+            .write_all_at(1, &initial_offset)
             .map_err(ZeboError::OperationError)?;
 
         Ok(Self {
@@ -55,7 +57,7 @@ impl<DocId: DocumentId> ZeboIndex<DocId> {
 
         let mut buf = [0; 1];
         index_file
-            .read_exact_at(&mut buf, 0)
+            .read_exact_at(0, &mut buf)
             .map_err(ZeboError::OperationError)?;
         let version = buf[0];
         if version != Version::V1.into() {
@@ -67,7 +69,7 @@ impl<DocId: DocumentId> ZeboIndex<DocId> {
 
         let mut offset = [0; 8];
         index_file
-            .read_exact_at(&mut offset, 1)
+            .read_exact_at(1, &mut offset)
             .map_err(ZeboError::OperationError)?;
         let offset = u64::from_be_bytes(offset);
 
@@ -89,15 +91,15 @@ impl<DocId: DocumentId> ZeboIndex<DocId> {
         buf[8..16].copy_from_slice(&start_doc_id.as_u64().to_be_bytes());
 
         self.index_file
-            .write_all_at(&buf, self.offset)
+            .write_all_at(self.offset, &buf)
             .map_err(ZeboError::OperationError)?;
 
         self.offset += 8 + 8; // buf.len()
         self.index_file
-            .write_all_at(&self.offset.to_be_bytes(), 1)
+            .write_all_at(1, &self.offset.to_be_bytes())
             .map_err(ZeboError::OperationError)?;
 
-        self.index_file.flush().map_err(ZeboError::OperationError)?;
+        Write::flush(&mut self.index_file).map_err(ZeboError::OperationError)?;
         self.index_file
             .sync_all()
             .map_err(ZeboError::OperationError)?;
@@ -108,7 +110,7 @@ impl<DocId: DocumentId> ZeboIndex<DocId> {
     pub fn get_page_ids(&self) -> Result<Vec<PageId>> {
         let mut buf = vec![0; (self.offset - 8 - 1) as usize];
         self.index_file
-            .read_exact_at(&mut buf, 9)
+            .read_exact_at(9, &mut buf)
             .map_err(ZeboError::OperationError)?;
 
         let expected_page_size = (self.offset - 8 - 1) / (8 + 8);
@@ -133,7 +135,7 @@ impl<DocId: DocumentId> ZeboIndex<DocId> {
     ) -> Result<()> {
         let mut buf = vec![0; (self.offset - 8 - 1) as usize];
         self.index_file
-            .read_exact_at(&mut buf, 9)
+            .read_exact_at(9, &mut buf)
             .map_err(ZeboError::OperationError)?;
 
         let expected_page_size = (self.offset - 8 - 1) / (8 + 8);
@@ -183,7 +185,7 @@ impl<DocId: DocumentId> ZeboIndex<DocId> {
     pub fn get_all_pages(&self) -> Result<Vec<(u64, PageId)>> {
         let mut buf = vec![0; (self.offset - 8 - 1) as usize];
         self.index_file
-            .read_exact_at(&mut buf, 9)
+            .read_exact_at(9, &mut buf)
             .map_err(ZeboError::OperationError)?;
 
         let expected_page_size = (self.offset - 8 - 1) / (8 + 8);
