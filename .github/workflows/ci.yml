@@ -12,8 +12,30 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  build:
+  lint:
+    runs-on: ubuntu-latest
 
+    steps:
+    - uses: actions/checkout@v4
+    - name: Set up cargo cache
+      uses: actions/cache@v3
+      continue-on-error: false
+      with:
+        path: |
+          ~/.cargo/bin/
+          ~/.cargo/registry/index/
+          ~/.cargo/registry/cache/
+          ~/.cargo/git/db/
+          target/
+        key: cargo-lint-${{ hashFiles('**/Cargo.lock') }}
+        restore-keys: cargo-lint-
+    - name: Fmt
+      run: cargo fmt -- --check
+    - name: Clippy
+      run: cargo clippy
+
+  build:
+    needs: lint
     strategy:
       matrix:
         os: [ubuntu-latest, windows-latest]
@@ -33,15 +55,7 @@ jobs:
           target/
         key: cargo-${{ matrix.os }}-${{ hashFiles('**/Cargo.lock') }}
         restore-keys: cargo-${{ matrix.os }}-
-    - name: Check & Fmt & Clippy
-      if: matrix.os == 'ubuntu-latest'
-      run: |
-        cargo check
-        cargo fmt -- --check
-        cargo clippy
     - name: Test
-      run: |
-        cargo test
+      run: cargo test
     - name: Build
-      run: |
-        cargo build
+      run: cargo build
