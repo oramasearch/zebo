@@ -1,4 +1,6 @@
-use std::{fs::File, io::Write, os::unix::fs::FileExt};
+use std::{fs::File, io::Write};
+
+use positioned_io::{ReadAt, WriteAt};
 
 use tracing::{debug, error, instrument, trace};
 
@@ -70,33 +72,33 @@ impl ZeboPage {
 
         // Version on first byte
         page_file
-            .write_all_at(&[Version::V1.into()], VERSION_OFFSET)
+            .write_all_at(VERSION_OFFSET, &[Version::V1.into()])
             .map_err(ZeboError::OperationError)?;
         // document count limit
         page_file
-            .write_all_at(&document_limit.to_be_bytes(), DOCUMENT_COUNT_LIMIT_OFFSET)
+            .write_all_at(DOCUMENT_COUNT_LIMIT_OFFSET, &document_limit.to_be_bytes())
             .map_err(ZeboError::OperationError)?;
         // Number of documents
         page_file
-            .write_all_at(&[0; 4], DOCUMENT_COUNT_OFFSET)
+            .write_all_at(DOCUMENT_COUNT_OFFSET, &[0; 4])
             .map_err(ZeboError::OperationError)?;
         // Next available offset
         let initial_available_offset = (DOCUMENT_INDEX_OFFSET + document_header_size) as u32;
         page_file
             .write_all_at(
-                &initial_available_offset.to_be_bytes(),
                 NEXT_AVAILABLE_OFFSET,
+                &initial_available_offset.to_be_bytes(),
             )
             .map_err(ZeboError::OperationError)?;
         // Starting document id
         page_file
             .write_all_at(
-                &starting_document_id.to_be_bytes(),
                 STARTING_DOCUMENT_ID_OFFSET,
+                &starting_document_id.to_be_bytes(),
             )
             .map_err(ZeboError::OperationError)?;
 
-        page_file.flush().map_err(ZeboError::OperationError)?;
+        Write::flush(&mut page_file).map_err(ZeboError::OperationError)?;
         page_file.sync_all().map_err(ZeboError::OperationError)?;
 
         let s = Self {
@@ -112,7 +114,7 @@ impl ZeboPage {
     pub fn try_load(page_file: std::fs::File) -> Result<Self> {
         let mut buf = [0; 1];
         page_file
-            .read_exact_at(&mut buf, VERSION_OFFSET)
+            .read_exact_at(VERSION_OFFSET, &mut buf)
             .map_err(ZeboError::OperationError)?;
         let version = buf[0];
 
@@ -125,18 +127,18 @@ impl ZeboPage {
 
         let mut buf = [0; 4];
         page_file
-            .read_exact_at(&mut buf, DOCUMENT_COUNT_LIMIT_OFFSET)
+            .read_exact_at(DOCUMENT_COUNT_LIMIT_OFFSET, &mut buf)
             .map_err(ZeboError::OperationError)?;
         let document_limit = u32::from_be_bytes(buf);
 
         page_file
-            .read_exact_at(&mut buf, NEXT_AVAILABLE_HEADER_OFFSET)
+            .read_exact_at(NEXT_AVAILABLE_HEADER_OFFSET, &mut buf)
             .map_err(ZeboError::OperationError)?;
         let next_available_header_offset = u32::from_be_bytes(buf);
 
         let mut buf = [0; 8];
         page_file
-            .read_exact_at(&mut buf, STARTING_DOCUMENT_ID_OFFSET)
+            .read_exact_at(STARTING_DOCUMENT_ID_OFFSET, &mut buf)
             .map_err(ZeboError::OperationError)?;
         let starting_document_id = u64::from_be_bytes(buf);
 
@@ -151,7 +153,7 @@ impl ZeboPage {
     pub fn get_document_count(&self) -> Result<u32> {
         let mut buf = [0; 4];
         self.page_file
-            .read_exact_at(&mut buf, DOCUMENT_COUNT_OFFSET)
+            .read_exact_at(DOCUMENT_COUNT_OFFSET, &mut buf)
             .map_err(ZeboError::OperationError)?;
         let document_count = u32::from_be_bytes(buf);
 
@@ -161,7 +163,7 @@ impl ZeboPage {
     fn get_next_available_document_offset(&self) -> Result<u32> {
         let mut buf = [0; 4];
         self.page_file
-            .read_exact_at(&mut buf, NEXT_AVAILABLE_OFFSET)
+            .read_exact_at(NEXT_AVAILABLE_OFFSET, &mut buf)
             .map_err(ZeboError::OperationError)?;
         let next_available_offset = u32::from_be_bytes(buf);
 
@@ -289,8 +291,8 @@ impl ZeboPage {
             let mut buff = [0; 16];
             self.page_file
                 .read_exact_at(
-                    &mut buff,
                     DOCUMENT_INDEX_OFFSET + (probable_index.0 * (4 + 4 + 8)),
+                    &mut buff,
                 )
                 .unwrap();
             let found_id = u64::from_be_bytes([
@@ -312,7 +314,7 @@ impl ZeboPage {
                     // In this case, we don't need to read the document from the file
                     if document_len > 0 {
                         self.page_file
-                            .read_exact_at(&mut doc_buf, document_offset as u64)
+                            .read_exact_at(document_offset as u64, &mut doc_buf)
                             .map_err(ZeboError::OperationError)?;
                     }
 
@@ -343,8 +345,8 @@ impl ZeboPage {
 
             self.page_file
                 .read_exact_at(
-                    &mut buff,
                     DOCUMENT_INDEX_OFFSET + (probable_index.0 * (4 + 4 + 8)),
+                    &mut buff,
                 )
                 .unwrap();
             let new_found_id = u64::from_be_bytes([
@@ -368,7 +370,7 @@ impl ZeboPage {
                 // In this case, we don't need to read the document from the file
                 if document_len > 0 {
                     self.page_file
-                        .read_exact_at(&mut doc_buf, document_offset as u64)
+                        .read_exact_at(document_offset as u64, &mut doc_buf)
                         .map_err(ZeboError::OperationError)?;
                 }
 
@@ -389,13 +391,13 @@ impl ZeboPage {
     ) -> Result<ZeboPageReservedSpace<'docs, DocId, Doc>> {
         let mut buf = [0; 4];
         self.page_file
-            .read_exact_at(&mut buf, NEXT_AVAILABLE_OFFSET)
+            .read_exact_at(NEXT_AVAILABLE_OFFSET, &mut buf)
             .map_err(ZeboError::OperationError)?;
         // Available offsets are stored near to each other
         // So we can read them together
         let next_available_offset = u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]);
         self.page_file
-            .read_exact_at(&mut buf, NEXT_AVAILABLE_HEADER_OFFSET)
+            .read_exact_at(NEXT_AVAILABLE_HEADER_OFFSET, &mut buf)
             .map_err(ZeboError::OperationError)?;
         let next_available_header_offset = u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]);
 
@@ -410,23 +412,23 @@ impl ZeboPage {
         let mut buf = [0; 8];
         buf[0..4].copy_from_slice(&new_next_available_offset.to_be_bytes());
         self.page_file
-            .write_at(&buf, NEXT_AVAILABLE_OFFSET)
+            .write_at(NEXT_AVAILABLE_OFFSET, &buf)
             .map_err(ZeboError::OperationError)?;
         buf[0..4].copy_from_slice(&new_next_available_header_offset.to_be_bytes());
         self.page_file
-            .write_at(&buf, NEXT_AVAILABLE_HEADER_OFFSET)
+            .write_at(NEXT_AVAILABLE_HEADER_OFFSET, &buf)
             .map_err(ZeboError::OperationError)?;
 
         self.page_file
-            .read_exact_at(&mut buf, DOCUMENT_COUNT_OFFSET)
+            .read_exact_at(DOCUMENT_COUNT_OFFSET, &mut buf)
             .map_err(ZeboError::OperationError)?;
         let current_document_count = u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]);
         let new_document_count = current_document_count + document_count;
         self.page_file
-            .write_at(&new_document_count.to_be_bytes(), DOCUMENT_COUNT_OFFSET)
+            .write_at(DOCUMENT_COUNT_OFFSET, &new_document_count.to_be_bytes())
             .map_err(ZeboError::OperationError)?;
 
-        self.page_file.flush().map_err(ZeboError::OperationError)?;
+        Write::flush(&mut self.page_file).map_err(ZeboError::OperationError)?;
         self.page_file
             .sync_all()
             .map_err(ZeboError::OperationError)?;
@@ -470,7 +472,7 @@ impl ZeboPage {
                     }
 
                     self.page_file
-                        .write_all_at(&v[0..len], *document_offset as u64)
+                        .write_all_at(*document_offset as u64, &v[0..len])
                         .map_err(ZeboError::OperationError)?;
                 }
             }
@@ -499,7 +501,7 @@ impl ZeboPage {
                 buf[8..12].copy_from_slice(&u32::MAX.to_be_bytes());
                 buf[12..16].copy_from_slice(&u32::MAX.to_be_bytes());
                 self.page_file
-                    .write_all_at(&buf, DOCUMENT_INDEX_OFFSET + (i * (4 + 4 + 8)) as u64)
+                    .write_all_at(DOCUMENT_INDEX_OFFSET + (i * (4 + 4 + 8)) as u64, &buf)
                     .map_err(ZeboError::OperationError)?;
 
                 found += 1;
@@ -511,11 +513,11 @@ impl ZeboPage {
             let document_count = self.get_document_count()?;
             let new_document_count = document_count - found;
             self.page_file
-                .write_all_at(&new_document_count.to_be_bytes(), DOCUMENT_COUNT_OFFSET)
+                .write_all_at(DOCUMENT_COUNT_OFFSET, &new_document_count.to_be_bytes())
                 .map_err(ZeboError::OperationError)?;
         }
 
-        self.page_file.flush().map_err(ZeboError::OperationError)?;
+        Write::flush(&mut self.page_file).map_err(ZeboError::OperationError)?;
         self.page_file
             .sync_all()
             .map_err(ZeboError::OperationError)?;
@@ -530,8 +532,8 @@ impl ZeboPage {
 
         let mut buf = [0; 16];
         if let Err(e) = self.page_file.read_exact_at(
-            &mut buf,
             DOCUMENT_INDEX_OFFSET + (document_index * (4 + 4 + 8)),
+            &mut buf,
         ) {
             if e.kind() == std::io::ErrorKind::UnexpectedEof {
                 // Reached the end of the file
@@ -731,7 +733,7 @@ impl ZeboPage {
         for i in starting_index..=ending_index {
             match self
                 .page_file
-                .read_exact_at(&mut buf, DOCUMENT_INDEX_OFFSET + (i * (4 + 4 + 8)))
+                .read_exact_at(DOCUMENT_INDEX_OFFSET + (i * (4 + 4 + 8)), &mut buf)
             {
                 Ok(_) => {}
                 Err(e) => {
@@ -769,7 +771,7 @@ impl ZeboPage {
         loop {
             match self
                 .page_file
-                .read_exact_at(&mut buf, DOCUMENT_INDEX_OFFSET + (i * (4 + 4 + 8)))
+                .read_exact_at(DOCUMENT_INDEX_OFFSET + (i * (4 + 4 + 8)), &mut buf)
             {
                 Ok(_) => {
                     let doc_id = u64::from_be_bytes([
@@ -802,7 +804,7 @@ impl ZeboPage {
     }
 
     pub fn close(&mut self) -> Result<()> {
-        self.page_file.flush().map_err(ZeboError::OperationError)?;
+        Write::flush(&mut self.page_file).map_err(ZeboError::OperationError)?;
         self.page_file
             .sync_all()
             .map_err(ZeboError::OperationError)?;
@@ -822,7 +824,7 @@ impl ZeboPage {
     ) -> Result<()> {
         let mut buf = [0; 1];
         self.page_file
-            .read_exact_at(&mut buf, VERSION_OFFSET)
+            .read_exact_at(VERSION_OFFSET, &mut buf)
             .unwrap();
 
         let version = u8::from_be_bytes(buf);
@@ -830,7 +832,7 @@ impl ZeboPage {
 
         let mut buf = [0; 4];
         self.page_file
-            .read_exact_at(&mut buf, DOCUMENT_COUNT_LIMIT_OFFSET)
+            .read_exact_at(DOCUMENT_COUNT_LIMIT_OFFSET, &mut buf)
             .unwrap();
 
         let document_limit = u32::from_be_bytes(buf);
@@ -838,7 +840,7 @@ impl ZeboPage {
 
         let mut buf = [0; 4];
         self.page_file
-            .read_exact_at(&mut buf, DOCUMENT_COUNT_OFFSET)
+            .read_exact_at(DOCUMENT_COUNT_OFFSET, &mut buf)
             .unwrap();
 
         let document_count = u32::from_be_bytes(buf);
@@ -846,7 +848,7 @@ impl ZeboPage {
 
         let mut buf = [0; 4];
         self.page_file
-            .read_exact_at(&mut buf, NEXT_AVAILABLE_OFFSET)
+            .read_exact_at(NEXT_AVAILABLE_OFFSET, &mut buf)
             .unwrap();
 
         let next_available_offset = u32::from_be_bytes(buf);
@@ -854,7 +856,7 @@ impl ZeboPage {
 
         let mut buf = [0; 4];
         self.page_file
-            .read_exact_at(&mut buf, NEXT_AVAILABLE_HEADER_OFFSET)
+            .read_exact_at(NEXT_AVAILABLE_HEADER_OFFSET, &mut buf)
             .unwrap();
 
         let next_available_header_offset = u32::from_be_bytes(buf);
@@ -866,7 +868,7 @@ impl ZeboPage {
 
         let mut buf = [0; 8];
         self.page_file
-            .read_exact_at(&mut buf, DOCUMENT_INDEX_OFFSET)
+            .read_exact_at(DOCUMENT_INDEX_OFFSET, &mut buf)
             .unwrap();
 
         let starting_document_id = u64::from_be_bytes(buf);
@@ -885,13 +887,13 @@ impl ZeboPage {
                 break;
             }
 
-            self.page_file.read_exact_at(&mut doc_id, offset).unwrap();
+            self.page_file.read_exact_at(offset, &mut doc_id).unwrap();
             if doc_id == [0; 8] {
                 break;
             }
             match self
                 .page_file
-                .read_exact_at(&mut starting_offset, offset + 8)
+                .read_exact_at(offset + 8, &mut starting_offset)
             {
                 Ok(_) => {}
                 Err(e) => {
@@ -901,7 +903,7 @@ impl ZeboPage {
                     return Err(ZeboError::OperationError(e));
                 }
             };
-            match self.page_file.read_exact_at(&mut bytes_length, offset + 12) {
+            match self.page_file.read_exact_at(offset + 12, &mut bytes_length) {
                 Ok(_) => {}
                 Err(e) => {
                     if e.kind() == std::io::ErrorKind::UnexpectedEof {
@@ -956,7 +958,7 @@ impl ZeboPage {
                 let slice = &mut docs[0..bytes_length as usize];
 
                 if !skip_content_checks {
-                    if let Err(e) = self.page_file.read_exact_at(slice, starting_offset as u64) {
+                    if let Err(e) = self.page_file.read_exact_at(starting_offset as u64, slice) {
                         if e.kind() == std::io::ErrorKind::UnexpectedEof {
                             writeln!(writer, "Document content: [incomplete data, expected length {bytes_length} bytes]").unwrap();
                             continue;
@@ -975,7 +977,7 @@ impl ZeboPage {
 
                 if !skip_document_content {
                     self.page_file
-                        .read_exact_at(slice, starting_offset as u64)
+                        .read_exact_at(starting_offset as u64, slice)
                         .unwrap();
                     match String::from_utf8(slice.to_vec()) {
                         Ok(s) => {
@@ -1048,15 +1050,15 @@ impl<'docs, DocId: DocumentId, Doc: Document> ZeboPageReservedSpace<'docs, DocId
 
         self.file
             .write_all_at(
-                &document_size_per_doc,
                 DOCUMENT_INDEX_OFFSET + (self.next_available_header_offset * 16) as u64,
+                &document_size_per_doc,
             )
             .map_err(ZeboError::OperationError)?;
         self.file
-            .write_all_at(&all_document_bytes, self.next_available_offset as u64)
+            .write_all_at(self.next_available_offset as u64, &all_document_bytes)
             .map_err(ZeboError::OperationError)?;
 
-        self.file.flush().map_err(ZeboError::OperationError)?;
+        Write::flush(&mut self.file).map_err(ZeboError::OperationError)?;
         self.file.sync_all().map_err(ZeboError::OperationError)?;
 
         Ok(())
@@ -1510,13 +1512,13 @@ mod tests {
 
         // Write old deletion format at slot 1 (where document 2 was)
         page.page_file
-            .write_all_at(&old_deletion_buf, DOCUMENT_INDEX_OFFSET + 16)
+            .write_all_at(DOCUMENT_INDEX_OFFSET + 16, &old_deletion_buf)
             .unwrap();
 
         // Update document count to reflect the deletion
         let document_count = page.get_document_count().unwrap();
         page.page_file
-            .write_all_at(&(document_count - 1).to_be_bytes(), DOCUMENT_COUNT_OFFSET)
+            .write_all_at(DOCUMENT_COUNT_OFFSET, &(document_count - 1).to_be_bytes())
             .unwrap();
 
         // Test that get_header() correctly skips old-style deletions
@@ -1574,7 +1576,7 @@ mod tests {
         old_deletion_buf[8..12].copy_from_slice(&u32::MAX.to_be_bytes());
         old_deletion_buf[12..16].copy_from_slice(&u32::MAX.to_be_bytes());
         page.page_file
-            .write_all_at(&old_deletion_buf, DOCUMENT_INDEX_OFFSET + 16)
+            .write_all_at(DOCUMENT_INDEX_OFFSET + 16, &old_deletion_buf)
             .unwrap();
 
         // Delete document 4 using new format (via delete_documents)
@@ -1748,7 +1750,7 @@ mod tests {
 
         // Overwrite slot 1 (originally doc 102) with this corrupted deleted entry
         page.page_file
-            .write_all_at(&deleted_entry_buf, DOCUMENT_INDEX_OFFSET + 16)
+            .write_all_at(DOCUMENT_INDEX_OFFSET + 16, &deleted_entry_buf)
             .expect("Failed to write corrupted entry");
 
         // Step 3: Test fallback search behavior
