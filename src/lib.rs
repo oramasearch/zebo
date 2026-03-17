@@ -19,7 +19,14 @@ pub use error::*;
 use index::{ProbableIndex, ZeboIndex};
 use page::{DOCUMENT_INDEX_OFFSET, ZeboPage, ZeboPageHeader};
 
-pub use crate::page::ZeboPageReservedSpace;
+pub use crate::page::{CompactPageStats, ZeboPageReservedSpace};
+
+#[derive(Debug)]
+pub struct CompactStats {
+    pub pages_compacted: u32,
+    pub pages_skipped: u32,
+    pub total_bytes_reclaimed: u64,
+}
 
 #[derive(Debug, PartialEq)]
 pub struct ZeboInfo {
@@ -165,6 +172,92 @@ impl<const MAX_DOC_PER_PAGE: u32, const PAGE_SIZE: u64, DocId: DocumentId>
         }
 
         Ok(removed)
+    }
+
+    /// Compacts all pages except the current one by rewriting them to reclaim
+    /// space from deleted documents. The data region is compacted while header
+    /// slots (including deleted sentinel entries) are preserved.
+    pub fn compact(&mut self) -> Result<CompactStats> {
+        let page_ids = self.index.get_page_ids()?;
+        let current_page_id = if self.current_page.is_some() {
+            Some(PageId(self.next_page_id - 1))
+        } else {
+            None
+        };
+
+        let mut stats = CompactStats {
+            pages_compacted: 0,
+            pages_skipped: 0,
+            total_bytes_reclaimed: 0,
+        };
+
+        let mut buf = Vec::new();
+
+        for page_id in page_ids {
+            if Some(page_id) == current_page_id {
+                stats.pages_skipped += 1;
+                continue;
+            }
+
+            let page = load_page(&self.base_dir, page_id, Mode::Read)?;
+
+            // Check if compaction would reclaim space: compare actual file size
+            // against header size + total live document data
+            let file_size =
+                std::fs::metadata(self.base_dir.join(format!("page_{}.zebo", page_id.0)))
+                    .map_err(ZeboError::OperationError)?
+                    .len();
+            let header_size = DOCUMENT_INDEX_OFFSET + (page.document_limit() as u64) * 16;
+            let live_data_size = page.live_data_size()?;
+            let compacted_size = header_size + live_data_size;
+            if file_size <= compacted_size {
+                stats.pages_skipped += 1;
+                continue;
+            }
+
+            let temp_path = self
+                .base_dir
+                .join(format!("page_{}.zebo.compact_tmp", page_id.0));
+            let original_path = self.base_dir.join(format!("page_{}.zebo", page_id.0));
+
+            let result = (|| -> Result<CompactPageStats> {
+                let mut temp_file = std::fs::File::options()
+                    .create(true)
+                    .write(true)
+                    .read(true)
+                    .truncate(true)
+                    .open(&temp_path)
+                    .map_err(ZeboError::OperationError)?;
+
+                let page_stats = page.compact_to_file(&mut temp_file, &mut buf)?;
+                Ok(page_stats)
+            })();
+
+            match result {
+                Ok(page_stats) => {
+                    std::fs::rename(&temp_path, &original_path)
+                        .map_err(ZeboError::OperationError)?;
+
+                    #[cfg(unix)]
+                    {
+                        let dir = std::fs::File::open(&self.base_dir)
+                            .map_err(ZeboError::OperationError)?;
+                        dir.sync_all().map_err(ZeboError::OperationError)?;
+                    }
+
+                    stats.total_bytes_reclaimed += page_stats
+                        .bytes_before
+                        .saturating_sub(page_stats.bytes_after);
+                    stats.pages_compacted += 1;
+                }
+                Err(e) => {
+                    let _ = std::fs::remove_file(&temp_path);
+                    return Err(e);
+                }
+            }
+        }
+
+        Ok(stats)
     }
 
     /// Returns an iterator with the order guarantees
@@ -1404,6 +1497,163 @@ mod tests {
 
         let result = zebo.get_last_inserted_document_id().unwrap();
         assert_eq!(result, Some(6));
+    }
+
+    #[test]
+    fn test_compact_basic() {
+        let test_dir = prepare_test_dir();
+
+        let mut zebo: Zebo<3, 2048, u32> = Zebo::<3, 2048, _>::try_new(test_dir.clone()).unwrap();
+
+        // Fill page 0 (3 docs), then page 1 (3 docs), then page 2 (current)
+        zebo.reserve_space_for(&[(1, "aaa"), (2, "bbb"), (3, "ccc")])
+            .unwrap()
+            .write_all()
+            .unwrap();
+        zebo.reserve_space_for(&[(4, "ddd"), (5, "eee"), (6, "fff")])
+            .unwrap()
+            .write_all()
+            .unwrap();
+        zebo.reserve_space_for(&[(7, "ggg")])
+            .unwrap()
+            .write_all()
+            .unwrap();
+
+        // Delete some docs from page 0 and page 1
+        zebo.remove_documents(vec![1, 2, 5], true).unwrap();
+
+        // Get file sizes before compaction
+        let page0_size_before = std::fs::metadata(test_dir.join("page_0.zebo"))
+            .unwrap()
+            .len();
+        let page2_size_before = std::fs::metadata(test_dir.join("page_2.zebo"))
+            .unwrap()
+            .len();
+
+        let stats = zebo.compact().unwrap();
+
+        assert_eq!(stats.pages_compacted, 2);
+        // current page (page 2) should be skipped
+        assert_eq!(stats.pages_skipped, 1);
+        assert!(stats.total_bytes_reclaimed > 0);
+
+        // Page 0 should be smaller (2 docs deleted out of 3)
+        let page0_size_after = std::fs::metadata(test_dir.join("page_0.zebo"))
+            .unwrap()
+            .len();
+        assert!(page0_size_after < page0_size_before);
+
+        // Current page (page 2) should be unchanged
+        let page2_size_after = std::fs::metadata(test_dir.join("page_2.zebo"))
+            .unwrap()
+            .len();
+        assert_eq!(page2_size_after, page2_size_before);
+
+        // All live docs should still be retrievable
+        assert!(zebo.get_document(1).unwrap().is_none());
+        assert!(zebo.get_document(2).unwrap().is_none());
+        assert_eq!(zebo.get_document(3).unwrap().unwrap(), b"ccc");
+        assert_eq!(zebo.get_document(4).unwrap().unwrap(), b"ddd");
+        assert!(zebo.get_document(5).unwrap().is_none());
+        assert_eq!(zebo.get_document(6).unwrap().unwrap(), b"fff");
+        assert_eq!(zebo.get_document(7).unwrap().unwrap(), b"ggg");
+    }
+
+    #[test]
+    fn test_compact_idempotent() {
+        let test_dir = prepare_test_dir();
+
+        let mut zebo: Zebo<3, 2048, u32> = Zebo::<3, 2048, _>::try_new(test_dir.clone()).unwrap();
+
+        zebo.reserve_space_for(&[(1, "aaa"), (2, "bbb"), (3, "ccc")])
+            .unwrap()
+            .write_all()
+            .unwrap();
+        zebo.reserve_space_for(&[(4, "ddd")])
+            .unwrap()
+            .write_all()
+            .unwrap();
+
+        zebo.remove_documents(vec![2], true).unwrap();
+
+        let stats1 = zebo.compact().unwrap();
+        assert_eq!(stats1.pages_compacted, 1);
+
+        // Second compact should find nothing to do
+        let stats2 = zebo.compact().unwrap();
+        assert_eq!(stats2.pages_compacted, 0);
+        assert_eq!(stats2.total_bytes_reclaimed, 0);
+
+        // Docs still accessible
+        assert_eq!(zebo.get_document(1).unwrap().unwrap(), b"aaa");
+        assert_eq!(zebo.get_document(3).unwrap().unwrap(), b"ccc");
+    }
+
+    #[test]
+    fn test_compact_all_deleted_page() {
+        let test_dir = prepare_test_dir();
+
+        let mut zebo: Zebo<3, 2048, u32> = Zebo::<3, 2048, _>::try_new(test_dir.clone()).unwrap();
+
+        zebo.reserve_space_for(&[(1, "aaa"), (2, "bbb"), (3, "ccc")])
+            .unwrap()
+            .write_all()
+            .unwrap();
+        zebo.reserve_space_for(&[(4, "ddd")])
+            .unwrap()
+            .write_all()
+            .unwrap();
+
+        // Delete all docs from page 0
+        zebo.remove_documents(vec![1, 2, 3], true).unwrap();
+
+        let page0_size_before = std::fs::metadata(test_dir.join("page_0.zebo"))
+            .unwrap()
+            .len();
+
+        let stats = zebo.compact().unwrap();
+        assert_eq!(stats.pages_compacted, 1);
+
+        // Page should now be header-only (no data region)
+        let page0_size_after = std::fs::metadata(test_dir.join("page_0.zebo"))
+            .unwrap()
+            .len();
+        assert!(page0_size_after < page0_size_before);
+
+        // Page 1 (current) doc should still work
+        assert_eq!(zebo.get_document(4).unwrap().unwrap(), b"ddd");
+    }
+
+    #[test]
+    fn test_compact_then_insert() {
+        let test_dir = prepare_test_dir();
+
+        let mut zebo: Zebo<3, 2048, u32> = Zebo::<3, 2048, _>::try_new(test_dir.clone()).unwrap();
+
+        zebo.reserve_space_for(&[(1, "aaa"), (2, "bbb"), (3, "ccc")])
+            .unwrap()
+            .write_all()
+            .unwrap();
+        zebo.reserve_space_for(&[(4, "ddd")])
+            .unwrap()
+            .write_all()
+            .unwrap();
+
+        zebo.remove_documents(vec![2], true).unwrap();
+        zebo.compact().unwrap();
+
+        // Insert more docs after compaction
+        zebo.reserve_space_for(&[(5, "eee"), (6, "fff")])
+            .unwrap()
+            .write_all()
+            .unwrap();
+
+        assert_eq!(zebo.get_document(1).unwrap().unwrap(), b"aaa");
+        assert!(zebo.get_document(2).unwrap().is_none());
+        assert_eq!(zebo.get_document(3).unwrap().unwrap(), b"ccc");
+        assert_eq!(zebo.get_document(4).unwrap().unwrap(), b"ddd");
+        assert_eq!(zebo.get_document(5).unwrap().unwrap(), b"eee");
+        assert_eq!(zebo.get_document(6).unwrap().unwrap(), b"fff");
     }
 
     struct MyDoc {
