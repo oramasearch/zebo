@@ -207,7 +207,7 @@ impl<const MAX_DOC_PER_PAGE: u32, const PAGE_SIZE: u64, DocId: DocumentId>
                 std::fs::metadata(self.base_dir.join(format!("page_{}.zebo", page_id.0)))
                     .map_err(ZeboError::OperationError)?
                     .len();
-            let header_size = DOCUMENT_INDEX_OFFSET + (page.document_limit() as u64) * 16;
+            let header_size = ZeboPage::header_size(page.document_limit());
             let live_data_size = page.live_data_size()?;
             let compacted_size = header_size + live_data_size;
             if file_size <= compacted_size {
@@ -1654,6 +1654,59 @@ mod tests {
         assert_eq!(zebo.get_document(4).unwrap().unwrap(), b"ddd");
         assert_eq!(zebo.get_document(5).unwrap().unwrap(), b"eee");
         assert_eq!(zebo.get_document(6).unwrap().unwrap(), b"fff");
+    }
+
+    #[test]
+    fn test_compact_reload() {
+        let test_dir = prepare_test_dir();
+
+        let mut zebo: Zebo<3, 2048, u32> = Zebo::<3, 2048, _>::try_new(test_dir.clone()).unwrap();
+
+        zebo.reserve_space_for(&[(1, "aaa"), (2, "bbb"), (3, "ccc")])
+            .unwrap()
+            .write_all()
+            .unwrap();
+        zebo.reserve_space_for(&[(4, "ddd"), (5, "eee"), (6, "fff")])
+            .unwrap()
+            .write_all()
+            .unwrap();
+        zebo.reserve_space_for(&[(7, "ggg")])
+            .unwrap()
+            .write_all()
+            .unwrap();
+
+        zebo.remove_documents(vec![1, 2, 5], true).unwrap();
+        zebo.compact().unwrap();
+
+        // Drop and reload from disk
+        drop(zebo);
+        let mut zebo: Zebo<3, 2048, u32> = Zebo::<3, 2048, _>::try_new(test_dir.clone()).unwrap();
+
+        // All live docs should be retrievable after reload
+        assert!(zebo.get_document(1).unwrap().is_none());
+        assert!(zebo.get_document(2).unwrap().is_none());
+        assert_eq!(zebo.get_document(3).unwrap().unwrap(), b"ccc");
+        assert_eq!(zebo.get_document(4).unwrap().unwrap(), b"ddd");
+        assert!(zebo.get_document(5).unwrap().is_none());
+        assert_eq!(zebo.get_document(6).unwrap().unwrap(), b"fff");
+        assert_eq!(zebo.get_document(7).unwrap().unwrap(), b"ggg");
+
+        // Info should reflect correct counts
+        let info = zebo.get_info().unwrap();
+        assert_eq!(info.document_count, 4);
+
+        // New inserts after reload should work
+        zebo.reserve_space_for(&[(8, "hhh"), (9, "iii")])
+            .unwrap()
+            .write_all()
+            .unwrap();
+
+        assert_eq!(zebo.get_document(8).unwrap().unwrap(), b"hhh");
+        assert_eq!(zebo.get_document(9).unwrap().unwrap(), b"iii");
+
+        // Second compact after reload should be idempotent
+        let stats = zebo.compact().unwrap();
+        assert_eq!(stats.pages_compacted, 0);
     }
 
     struct MyDoc {

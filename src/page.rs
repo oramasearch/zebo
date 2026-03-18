@@ -53,19 +53,25 @@ pub struct ZeboPage {
 }
 
 impl ZeboPage {
+    #[inline]
+    pub fn header_size(document_limit: u32) -> u64 {
+        // 8 bytes: doc_id.as_u64()
+        // 4 bytes: starting offset
+        // 4 bytes: bytes length
+        // 8 + 4 + 4 = 16 bytes per document header entry
+        DOCUMENT_INDEX_OFFSET + (document_limit as u64) * 16
+    }
+
     pub fn try_new(
         document_limit: u32,
         starting_document_id: u64,
         mut page_file: std::fs::File,
     ) -> Result<Self> {
-        // 8 bytes: doc_id.as_u64()
-        // 4 bytes: starting offset
-        // 4 bytes: bytes length
-        let document_header_size = (4 + 4 + 8) * (document_limit as u64);
+        let header_size = Self::header_size(document_limit);
         // We shrink the file to contain at least the document header
         // this because we store documents *after* the header
         page_file
-            .set_len(DOCUMENT_INDEX_OFFSET + document_header_size)
+            .set_len(header_size)
             .map_err(ZeboError::OperationError)?;
 
         // Version on first byte
@@ -81,7 +87,7 @@ impl ZeboPage {
             .write_all_at(&[0; 4], DOCUMENT_COUNT_OFFSET)
             .map_err(ZeboError::OperationError)?;
         // Next available offset
-        let initial_available_offset = (DOCUMENT_INDEX_OFFSET + document_header_size) as u32;
+        let initial_available_offset = header_size as u32;
         page_file
             .write_all_at(
                 &initial_available_offset.to_be_bytes(),
@@ -830,7 +836,7 @@ impl ZeboPage {
             .map_err(ZeboError::OperationError)?
             .len();
 
-        let header_size = DOCUMENT_INDEX_OFFSET + (self.document_limit as u64) * 16;
+        let header_size = Self::header_size(self.document_limit);
         target_file
             .set_len(header_size)
             .map_err(ZeboError::OperationError)?;
