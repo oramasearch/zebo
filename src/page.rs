@@ -55,19 +55,25 @@ pub struct ZeboPage {
 }
 
 impl ZeboPage {
+    #[inline]
+    pub fn header_size(document_limit: u32) -> u64 {
+        // 8 bytes: doc_id.as_u64()
+        // 4 bytes: starting offset
+        // 4 bytes: bytes length
+        // 8 + 4 + 4 = 16 bytes per document header entry
+        DOCUMENT_INDEX_OFFSET + (document_limit as u64) * 16
+    }
+
     pub fn try_new(
         document_limit: u32,
         starting_document_id: u64,
         mut page_file: std::fs::File,
     ) -> Result<Self> {
-        // 8 bytes: doc_id.as_u64()
-        // 4 bytes: starting offset
-        // 4 bytes: bytes length
-        let document_header_size = (4 + 4 + 8) * (document_limit as u64);
+        let header_size = Self::header_size(document_limit);
         // We shrink the file to contain at least the document header
         // this because we store documents *after* the header
         page_file
-            .set_len(DOCUMENT_INDEX_OFFSET + document_header_size)
+            .set_len(header_size)
             .map_err(ZeboError::OperationError)?;
 
         // Version on first byte
@@ -83,7 +89,7 @@ impl ZeboPage {
             .write_all_at(DOCUMENT_COUNT_OFFSET, &[0; 4])
             .map_err(ZeboError::OperationError)?;
         // Next available offset
-        let initial_available_offset = (DOCUMENT_INDEX_OFFSET + document_header_size) as u32;
+        let initial_available_offset = header_size as u32;
         page_file
             .write_all_at(
                 NEXT_AVAILABLE_OFFSET,
@@ -148,6 +154,24 @@ impl ZeboPage {
             starting_document_id,
             next_available_header_offset,
         })
+    }
+
+    pub fn document_limit(&self) -> u32 {
+        self.document_limit
+    }
+
+    pub fn live_data_size(&self) -> Result<u64> {
+        let mut total: u64 = 0;
+        for i in 0..self.next_available_header_offset as u64 {
+            if let Some((doc_id, offset, length)) = self.get_at(i)? {
+                if Self::is_uninitialized_entry(offset) || Self::is_deleted(doc_id, offset, length)
+                {
+                    continue;
+                }
+                total += length as u64;
+            }
+        }
+        Ok(total)
     }
 
     pub fn get_document_count(&self) -> Result<u32> {
@@ -803,6 +827,130 @@ impl ZeboPage {
         Ok(None)
     }
 
+    pub fn compact_to_file(
+        &self,
+        target_file: &mut File,
+        buf: &mut Vec<u8>,
+    ) -> Result<CompactPageStats> {
+        let bytes_before = self
+            .page_file
+            .metadata()
+            .map_err(ZeboError::OperationError)?
+            .len();
+
+        let header_size = Self::header_size(self.document_limit);
+        target_file
+            .set_len(header_size)
+            .map_err(ZeboError::OperationError)?;
+
+        // Write version
+        target_file
+            .write_all_at(&[Version::V1.into()], VERSION_OFFSET)
+            .map_err(ZeboError::OperationError)?;
+        // Write document limit
+        target_file
+            .write_all_at(
+                &self.document_limit.to_be_bytes(),
+                DOCUMENT_COUNT_LIMIT_OFFSET,
+            )
+            .map_err(ZeboError::OperationError)?;
+        // Write starting document id
+        target_file
+            .write_all_at(
+                &self.starting_document_id.to_be_bytes(),
+                STARTING_DOCUMENT_ID_OFFSET,
+            )
+            .map_err(ZeboError::OperationError)?;
+
+        let mut write_cursor = header_size as u32;
+        let mut entry_buf = [0u8; 16];
+
+        for i in 0..self.next_available_header_offset as u64 {
+            let (doc_id, offset, length) = match self.get_at(i)? {
+                Some(v) => v,
+                None => continue,
+            };
+
+            let index_pos = DOCUMENT_INDEX_OFFSET + i * 16;
+
+            if Self::is_uninitialized_entry(offset) {
+                // Write zeroed entry
+                entry_buf = [0u8; 16];
+                target_file
+                    .write_all_at(&entry_buf, index_pos)
+                    .map_err(ZeboError::OperationError)?;
+            } else if Self::is_deleted(doc_id, offset, length) {
+                // Preserve doc_id, write sentinel offset/length
+                entry_buf[0..8].copy_from_slice(&doc_id.to_be_bytes());
+                entry_buf[8..12].copy_from_slice(&u32::MAX.to_be_bytes());
+                entry_buf[12..16].copy_from_slice(&u32::MAX.to_be_bytes());
+                target_file
+                    .write_all_at(&entry_buf, index_pos)
+                    .map_err(ZeboError::OperationError)?;
+            } else {
+                // Live document: read data from source, write to new location
+                if length > 0 {
+                    let len = length as usize;
+                    if buf.len() < len {
+                        buf.resize(len, 0);
+                    }
+                    self.page_file
+                        .read_exact_at(&mut buf[..len], offset as u64)
+                        .map_err(ZeboError::OperationError)?;
+                    target_file
+                        .write_all_at(&buf[..len], write_cursor as u64)
+                        .map_err(ZeboError::OperationError)?;
+                }
+
+                entry_buf[0..8].copy_from_slice(&doc_id.to_be_bytes());
+                entry_buf[8..12].copy_from_slice(&write_cursor.to_be_bytes());
+                entry_buf[12..16].copy_from_slice(&length.to_be_bytes());
+                target_file
+                    .write_all_at(&entry_buf, index_pos)
+                    .map_err(ZeboError::OperationError)?;
+
+                write_cursor += length;
+            }
+        }
+
+        // Zero-fill remaining slots
+        let zero_entry = [0u8; 16];
+        for i in self.next_available_header_offset as u64..self.document_limit as u64 {
+            let index_pos = DOCUMENT_INDEX_OFFSET + i * 16;
+            target_file
+                .write_all_at(&zero_entry, index_pos)
+                .map_err(ZeboError::OperationError)?;
+        }
+
+        // Write metadata
+        let document_count = self.get_document_count()?;
+        target_file
+            .write_all_at(&document_count.to_be_bytes(), DOCUMENT_COUNT_OFFSET)
+            .map_err(ZeboError::OperationError)?;
+        target_file
+            .write_all_at(&write_cursor.to_be_bytes(), NEXT_AVAILABLE_OFFSET)
+            .map_err(ZeboError::OperationError)?;
+        target_file
+            .write_all_at(
+                &self.next_available_header_offset.to_be_bytes(),
+                NEXT_AVAILABLE_HEADER_OFFSET,
+            )
+            .map_err(ZeboError::OperationError)?;
+
+        // Truncate to actual size
+        target_file
+            .set_len(write_cursor as u64)
+            .map_err(ZeboError::OperationError)?;
+
+        target_file.flush().map_err(ZeboError::OperationError)?;
+        target_file.sync_all().map_err(ZeboError::OperationError)?;
+
+        Ok(CompactPageStats {
+            bytes_before,
+            bytes_after: write_cursor as u64,
+        })
+    }
+
     pub fn close(&mut self) -> Result<()> {
         Write::flush(&mut self.page_file).map_err(ZeboError::OperationError)?;
         self.page_file
@@ -1063,6 +1211,12 @@ impl<'docs, DocId: DocumentId, Doc: Document> ZeboPageReservedSpace<'docs, DocId
 
         Ok(())
     }
+}
+
+#[derive(Debug)]
+pub struct CompactPageStats {
+    pub bytes_before: u64,
+    pub bytes_after: u64,
 }
 
 #[derive(Debug, PartialEq)]
