@@ -845,20 +845,20 @@ impl ZeboPage {
 
         // Write version
         target_file
-            .write_all_at(&[Version::V1.into()], VERSION_OFFSET)
+            .write_all_at(VERSION_OFFSET, &[Version::V1.into()])
             .map_err(ZeboError::OperationError)?;
         // Write document limit
         target_file
             .write_all_at(
-                &self.document_limit.to_be_bytes(),
                 DOCUMENT_COUNT_LIMIT_OFFSET,
+                &self.document_limit.to_be_bytes(),
             )
             .map_err(ZeboError::OperationError)?;
         // Write starting document id
         target_file
             .write_all_at(
-                &self.starting_document_id.to_be_bytes(),
                 STARTING_DOCUMENT_ID_OFFSET,
+                &self.starting_document_id.to_be_bytes(),
             )
             .map_err(ZeboError::OperationError)?;
 
@@ -877,7 +877,7 @@ impl ZeboPage {
                 // Write zeroed entry
                 entry_buf = [0u8; 16];
                 target_file
-                    .write_all_at(&entry_buf, index_pos)
+                    .write_all_at(index_pos, &entry_buf)
                     .map_err(ZeboError::OperationError)?;
             } else if Self::is_deleted(doc_id, offset, length) {
                 // Preserve doc_id, write sentinel offset/length
@@ -885,7 +885,7 @@ impl ZeboPage {
                 entry_buf[8..12].copy_from_slice(&u32::MAX.to_be_bytes());
                 entry_buf[12..16].copy_from_slice(&u32::MAX.to_be_bytes());
                 target_file
-                    .write_all_at(&entry_buf, index_pos)
+                    .write_all_at(index_pos, &entry_buf)
                     .map_err(ZeboError::OperationError)?;
             } else {
                 // Live document: read data from source, write to new location
@@ -895,10 +895,10 @@ impl ZeboPage {
                         buf.resize(len, 0);
                     }
                     self.page_file
-                        .read_exact_at(&mut buf[..len], offset as u64)
+                        .read_exact_at(offset as u64, &mut buf[..len])
                         .map_err(ZeboError::OperationError)?;
                     target_file
-                        .write_all_at(&buf[..len], write_cursor as u64)
+                        .write_all_at(write_cursor as u64, &buf[..len])
                         .map_err(ZeboError::OperationError)?;
                 }
 
@@ -906,7 +906,7 @@ impl ZeboPage {
                 entry_buf[8..12].copy_from_slice(&write_cursor.to_be_bytes());
                 entry_buf[12..16].copy_from_slice(&length.to_be_bytes());
                 target_file
-                    .write_all_at(&entry_buf, index_pos)
+                    .write_all_at(index_pos, &entry_buf)
                     .map_err(ZeboError::OperationError)?;
 
                 write_cursor += length;
@@ -918,22 +918,22 @@ impl ZeboPage {
         for i in self.next_available_header_offset as u64..self.document_limit as u64 {
             let index_pos = DOCUMENT_INDEX_OFFSET + i * 16;
             target_file
-                .write_all_at(&zero_entry, index_pos)
+                .write_all_at(index_pos, &zero_entry)
                 .map_err(ZeboError::OperationError)?;
         }
 
         // Write metadata
         let document_count = self.get_document_count()?;
         target_file
-            .write_all_at(&document_count.to_be_bytes(), DOCUMENT_COUNT_OFFSET)
+            .write_all_at(DOCUMENT_COUNT_OFFSET, &document_count.to_be_bytes())
             .map_err(ZeboError::OperationError)?;
         target_file
-            .write_all_at(&write_cursor.to_be_bytes(), NEXT_AVAILABLE_OFFSET)
+            .write_all_at(NEXT_AVAILABLE_OFFSET, &write_cursor.to_be_bytes())
             .map_err(ZeboError::OperationError)?;
         target_file
             .write_all_at(
-                &self.next_available_header_offset.to_be_bytes(),
                 NEXT_AVAILABLE_HEADER_OFFSET,
+                &self.next_available_header_offset.to_be_bytes(),
             )
             .map_err(ZeboError::OperationError)?;
 
@@ -942,7 +942,7 @@ impl ZeboPage {
             .set_len(write_cursor as u64)
             .map_err(ZeboError::OperationError)?;
 
-        target_file.flush().map_err(ZeboError::OperationError)?;
+        std::io::Write::flush(target_file).map_err(ZeboError::OperationError)?;
         target_file.sync_all().map_err(ZeboError::OperationError)?;
 
         Ok(CompactPageStats {
