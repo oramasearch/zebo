@@ -20,7 +20,7 @@ jobs:
     - name: Set up Rust
       uses: dtolnay/rust-toolchain@master
       with:
-        toolchain: "" # reads from rust-toolchain.toml
+        toolchain: "1.94.0"
     - name: Set up cargo cache
       uses: actions/cache@v3
       continue-on-error: false
@@ -50,7 +50,7 @@ jobs:
     - name: Set up Rust
       uses: dtolnay/rust-toolchain@master
       with:
-        toolchain: "" # reads from rust-toolchain.toml
+        toolchain: "1.94.0"
     - name: Set up cargo cache
       uses: actions/cache@v3
       continue-on-error: false
