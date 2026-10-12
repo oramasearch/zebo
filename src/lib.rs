@@ -43,7 +43,9 @@ pub trait DocumentId: Ord + Eq + std::hash::Hash + Debug + Copy {
 
 /// Zebo is a document storage system that stores documents in pages inside a directory:
 /// - Each page is a file that contains maximum `MAX_DOC_PER_PAGE` number of documents.
-/// - Zebo also tries to limit the page size up to `PAGE_SIZE` bytes.
+/// - Each page holds at most `PAGE_SIZE` bytes of document payload; the fixed-size index
+///   at the start of the page is not counted.
+/// - Each page file stays below 4 GiB, since payload offsets are stored as `u32`.
 ///
 /// In case a document is larger than `PAGE_SIZE`, a new page is created.
 /// In that case, the page size will higher than `PAGE_SIZE` bytes.
@@ -123,11 +125,16 @@ impl<const MAX_DOC_PER_PAGE: u32, const PAGE_SIZE: u64, DocId: DocumentId>
         })
     }
 
+    /// Reserves space for `docs` in the current page, first rotating to a new page when
+    /// the current one is out of document slots, would hold more than `PAGE_SIZE` payload
+    /// bytes (the fixed-size index is not counted), would push its `u32` payload offset
+    /// past `u32::MAX`, or has inconsistent offsets. A fresh page accepts its first batch
+    /// even when the batch alone exceeds `PAGE_SIZE`.
     pub fn reserve_space_for<'docs, Doc: Document>(
         &mut self,
         docs: &'docs [(DocId, Doc)],
     ) -> Result<ZeboPageReservedSpace<'docs, DocId, Doc>> {
-        let document_count = docs.len() as u32;
+        let document_count = u32::try_from(docs.len()).unwrap_or(u32::MAX);
         if document_count > MAX_DOC_PER_PAGE {
             return Err(ZeboError::TooManyDocuments {
                 max: MAX_DOC_PER_PAGE,
@@ -138,11 +145,33 @@ impl<const MAX_DOC_PER_PAGE: u32, const PAGE_SIZE: u64, DocId: DocumentId>
             return Err(ZeboError::NoDocToAdd);
         }
 
-        if let Some((_, page)) = self.current_page.as_mut() {
-            let total_document_count_in_page = page.next_available_header_offset;
-            let remain = MAX_DOC_PER_PAGE.saturating_sub(total_document_count_in_page);
+        let batch_bytes: u64 = docs.iter().map(|(_, doc)| doc.len() as u64).sum();
+        // Payload offsets are u32: a batch that does not fit even in a fresh page is refused.
+        if ZeboPage::header_size(MAX_DOC_PER_PAGE).saturating_add(batch_bytes) > u32::MAX as u64 {
+            return Err(ZeboError::NotEnoughSpace {
+                limit: u32::MAX,
+                new_allocation_requested: u32::try_from(batch_bytes).unwrap_or(u32::MAX),
+            });
+        }
 
-            if remain < document_count {
+        let current_page_id = self.next_page_id.saturating_sub(1);
+        if let Some((_, page)) = self.current_page.as_mut() {
+            let used_slots = page.next_available_header_offset;
+            let remain = MAX_DOC_PER_PAGE.saturating_sub(used_slots);
+            let header_size = ZeboPage::header_size(page.document_limit());
+            let next_offset = page.get_next_available_document_offset()? as u64;
+            let batch_end = next_offset.saturating_add(batch_bytes);
+            let payload_end = next_offset
+                .saturating_sub(header_size)
+                .saturating_add(batch_bytes);
+
+            let out_of_slots = remain < document_count;
+            let over_page_size = used_slots > 0 && payload_end > PAGE_SIZE;
+            let over_offset_limit = batch_end > u32::MAX as u64;
+            let inconsistent =
+                Self::has_inconsistent_offsets(current_page_id, page, next_offset, header_size)?;
+
+            if out_of_slots || over_page_size || over_offset_limit || inconsistent {
                 page.close()?;
                 self.current_page = None;
             }
@@ -157,6 +186,30 @@ impl<const MAX_DOC_PER_PAGE: u32, const PAGE_SIZE: u64, DocId: DocumentId>
         let reserved_page = current_page.reserve(docs)?;
 
         Ok(reserved_page)
+    }
+
+    /// A healthy page's next-write offset equals its file length (or exceeds it while a
+    /// reservation is still being written). An offset below the file length or inside the
+    /// index means the offset wrapped: writing there would overwrite existing payloads,
+    /// so such a page must never be written to again.
+    fn has_inconsistent_offsets(
+        page_id: u64,
+        page: &ZeboPage,
+        next_offset: u64,
+        header_size: u64,
+    ) -> Result<bool> {
+        let file_len = page.file_len()?;
+        let inconsistent = next_offset < file_len || next_offset < header_size;
+        if inconsistent {
+            tracing::warn!(
+                page_id,
+                next_offset,
+                file_len,
+                header_size,
+                "Page next-write offset is inconsistent with its file length; rotating to a new page"
+            );
+        }
+        Ok(inconsistent)
     }
 
     /// Removes documents associated to the given ids
@@ -220,7 +273,7 @@ impl<const MAX_DOC_PER_PAGE: u32, const PAGE_SIZE: u64, DocId: DocumentId>
                 .join(format!("page_{}.zebo.compact_tmp", page_id.0));
             let original_path = self.base_dir.join(format!("page_{}.zebo", page_id.0));
 
-            let result = (|| -> Result<CompactPageStats> {
+            let result = (|| -> Result<Option<CompactPageStats>> {
                 let mut temp_file = std::fs::File::options()
                     .create(true)
                     .write(true)
@@ -234,7 +287,12 @@ impl<const MAX_DOC_PER_PAGE: u32, const PAGE_SIZE: u64, DocId: DocumentId>
             })();
 
             match result {
-                Ok(page_stats) => {
+                Ok(None) => {
+                    // The page cannot be compacted safely: leave it as it is.
+                    let _ = std::fs::remove_file(&temp_path);
+                    stats.pages_skipped += 1;
+                }
+                Ok(Some(page_stats)) => {
                     std::fs::rename(&temp_path, &original_path)
                         .map_err(ZeboError::OperationError)?;
 
@@ -1707,6 +1765,212 @@ mod tests {
         // Second compact after reload should be idempotent
         let stats = zebo.compact().unwrap();
         assert_eq!(stats.pages_compacted, 0);
+    }
+
+    fn page_file_count(dir: &Path) -> usize {
+        std::fs::read_dir(dir)
+            .unwrap()
+            .filter_map(|entry| entry.ok()?.file_name().into_string().ok())
+            .filter(|name| name.starts_with("page_") && name.ends_with(".zebo"))
+            .count()
+    }
+
+    fn read_prefix(path: &Path, len: u64) -> Vec<u8> {
+        let file = std::fs::File::open(path).unwrap();
+        let mut buf = vec![0; len as usize];
+        positioned_io::ReadAt::read_exact_at(&file, 0, &mut buf).unwrap();
+        buf
+    }
+
+    fn seed_next_available_offset(path: &Path, offset: u32) {
+        let mut file = std::fs::File::options().write(true).open(path).unwrap();
+        positioned_io::WriteAt::write_all_at(
+            &mut file,
+            page::NEXT_AVAILABLE_OFFSET,
+            &offset.to_be_bytes(),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn page_rotates_on_byte_size() {
+        let test_dir = prepare_test_dir();
+        let doc = vec![b'x'; 1024];
+
+        let mut zebo = Zebo::<1000, 4096, u64>::try_new(&test_dir).unwrap();
+        for id in 1..=5_u64 {
+            zebo.reserve_space_for(&[(id, doc.clone())])
+                .unwrap()
+                .write_all()
+                .unwrap();
+        }
+        // Four 1 KiB payloads fill PAGE_SIZE; the fifth goes to a new page.
+        assert_eq!(page_file_count(&test_dir), 2);
+        for id in 1..=5_u64 {
+            assert_eq!(zebo.get_document(id).unwrap().unwrap(), doc);
+        }
+    }
+
+    #[test]
+    fn oversized_first_batch_fits_fresh_page() {
+        let test_dir = prepare_test_dir();
+        let big = vec![b'b'; 8 * 1024];
+
+        let mut zebo = Zebo::<1000, 1024, u64>::try_new(&test_dir).unwrap();
+        zebo.reserve_space_for(&[(1_u64, big.clone())])
+            .unwrap()
+            .write_all()
+            .unwrap();
+        assert_eq!(page_file_count(&test_dir), 1);
+        assert_eq!(zebo.get_document(1).unwrap().unwrap(), big);
+
+        // The next batch no longer fits that page.
+        zebo.reserve_space_for(&[(2_u64, "small")])
+            .unwrap()
+            .write_all()
+            .unwrap();
+        assert_eq!(page_file_count(&test_dir), 2);
+        assert_eq!(zebo.get_document(1).unwrap().unwrap(), big);
+        assert_eq!(zebo.get_document(2).unwrap().unwrap(), b"small");
+    }
+
+    // Wrapping only happens without overflow checks: run under `cargo test --release` too.
+    #[test]
+    fn offset_never_wraps() {
+        let test_dir = prepare_test_dir();
+        let page_path = test_dir.join("page_0.zebo");
+        let header_size = ZeboPage::header_size(10);
+
+        // PAGE_SIZE never triggers here: only the u32 offset limit can rotate the page.
+        let mut zebo = Zebo::<10, { u64::MAX }, u64>::try_new(&test_dir).unwrap();
+        zebo.reserve_space_for(&[(1_u64, "first")])
+            .unwrap()
+            .write_all()
+            .unwrap();
+
+        // Sparse file: the page looks like it holds ~4 GiB without writing them.
+        let seeded = u32::MAX - 100;
+        std::fs::File::options()
+            .write(true)
+            .open(&page_path)
+            .unwrap()
+            .set_len(seeded as u64)
+            .unwrap();
+        seed_next_available_offset(&page_path, seeded);
+        let header_before = read_prefix(&page_path, header_size);
+
+        let doc = vec![7_u8; 200];
+        zebo.reserve_space_for(&[(2_u64, doc.clone())])
+            .unwrap()
+            .write_all()
+            .unwrap();
+
+        assert_eq!(page_file_count(&test_dir), 2);
+        assert_eq!(read_prefix(&page_path, header_size), header_before);
+        assert_eq!(std::fs::metadata(&page_path).unwrap().len(), seeded as u64);
+        assert_eq!(zebo.get_document(1).unwrap().unwrap(), b"first");
+        assert_eq!(zebo.get_document(2).unwrap().unwrap(), doc);
+
+        std::fs::remove_dir_all(&test_dir).unwrap();
+    }
+
+    #[test]
+    fn batch_too_large_for_any_page_is_refused() {
+        let test_dir = prepare_test_dir();
+        let mut zebo = Zebo::<1_000_000, 1024, u64>::try_new(&test_dir).unwrap();
+
+        // header (16,000,025 bytes) + this batch overflows a u32 offset even on a fresh page.
+        struct Huge;
+        impl Document for Huge {
+            fn as_bytes(&self, _v: &mut Vec<u8>) {
+                unreachable!("never written")
+            }
+            fn len(&self) -> usize {
+                u32::MAX as usize
+            }
+        }
+
+        let result = zebo.reserve_space_for(&[(1_u64, Huge)]);
+        assert!(matches!(
+            result,
+            Err(ZeboError::NotEnoughSpace {
+                limit: u32::MAX,
+                ..
+            })
+        ));
+        assert_eq!(page_file_count(&test_dir), 0);
+    }
+
+    #[test]
+    fn page_with_inconsistent_offset_is_never_written() {
+        let test_dir = prepare_test_dir();
+        let page_path = test_dir.join("page_0.zebo");
+        let header_size = ZeboPage::header_size(10);
+
+        let mut zebo = Zebo::<10, { 1024 * 1024 }, u64>::try_new(&test_dir).unwrap();
+        zebo.reserve_space_for(&[(1_u64, vec![b'a'; 1000])])
+            .unwrap()
+            .write_all()
+            .unwrap();
+        zebo.reserve_space_for(&[(2_u64, vec![b'b'; 1000])])
+            .unwrap()
+            .write_all()
+            .unwrap();
+        drop(zebo);
+
+        // A wrapped offset: below the file length, pointing into existing payloads.
+        seed_next_available_offset(&page_path, header_size as u32 + 10);
+        let page_before = std::fs::read(&page_path).unwrap();
+
+        // Reload, as a restarted process would, then write.
+        let mut zebo = Zebo::<10, { 1024 * 1024 }, u64>::try_new(&test_dir).unwrap();
+        zebo.reserve_space_for(&[(3_u64, "new")])
+            .unwrap()
+            .write_all()
+            .unwrap();
+
+        assert_eq!(page_file_count(&test_dir), 2);
+        assert_eq!(std::fs::read(&page_path).unwrap(), page_before);
+        assert_eq!(zebo.get_document(1).unwrap().unwrap(), vec![b'a'; 1000]);
+        assert_eq!(zebo.get_document(2).unwrap().unwrap(), vec![b'b'; 1000]);
+        assert_eq!(zebo.get_document(3).unwrap().unwrap(), b"new");
+    }
+
+    #[test]
+    fn compact_skips_page_with_corrupt_entry() {
+        let test_dir = prepare_test_dir();
+        let page_path = test_dir.join("page_0.zebo");
+
+        let mut zebo = Zebo::<2, { 1024 * 1024 }, u64>::try_new(&test_dir).unwrap();
+        for id in 1..=3_u64 {
+            zebo.reserve_space_for(&[(id, "doc")])
+                .unwrap()
+                .write_all()
+                .unwrap();
+        }
+        // Delete one document so page 0 is a compaction candidate.
+        zebo.remove_documents(vec![1], false).unwrap();
+
+        // Point doc 2's entry past the end of the file.
+        let mut file = std::fs::File::options()
+            .write(true)
+            .open(&page_path)
+            .unwrap();
+        let mut entry = [0_u8; 16];
+        entry[0..8].copy_from_slice(&2_u64.to_be_bytes());
+        entry[8..12].copy_from_slice(&(ZeboPage::header_size(2) as u32).to_be_bytes());
+        entry[12..16].copy_from_slice(&(u32::MAX - 1).to_be_bytes());
+        positioned_io::WriteAt::write_all_at(&mut file, DOCUMENT_INDEX_OFFSET + 16, &entry)
+            .unwrap();
+        drop(file);
+        let page_before = std::fs::read(&page_path).unwrap();
+
+        let stats = zebo.compact().unwrap();
+        assert_eq!(stats.pages_compacted, 0);
+        assert_eq!(std::fs::read(&page_path).unwrap(), page_before);
+        assert!(!test_dir.join("page_0.zebo.compact_tmp").exists());
+        assert_eq!(zebo.get_document(2).unwrap(), None);
+        assert_eq!(zebo.get_document(3).unwrap().unwrap(), b"doc");
     }
 
     struct MyDoc {
