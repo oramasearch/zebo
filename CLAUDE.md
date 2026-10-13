@@ -24,6 +24,7 @@ Zebo is a Rust library for efficient filesystem-based document storage. It group
 - Pages automatically created when current page exceeds document count or size limits
 - Page size limit can be exceeded for single large documents
 - Document deletion marks entries with sentinel values (u64::MAX, u32::MAX)
+- A page whose u32 write offset wrapped is read-only: deletions go to a `page_N.deleted` sidecar (big-endian u64 doc ids), and the page is removed once none of its documents is live, unless it is the highest page (it keeps the last inserted id)
 - Batch insertion API for improved performance with multiple documents
 
 ## Development Commands

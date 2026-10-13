@@ -17,7 +17,7 @@ use std::{
 
 pub use error::*;
 use index::{ProbableIndex, ZeboIndex};
-use page::{DOCUMENT_INDEX_OFFSET, ZeboPage, ZeboPageHeader};
+use page::{DOCUMENT_INDEX_OFFSET, ZeboPage, ZeboPageHeader, sidecar_path};
 
 pub use crate::page::{CompactPageStats, ZeboPageReservedSpace};
 
@@ -128,8 +128,8 @@ impl<const MAX_DOC_PER_PAGE: u32, const PAGE_SIZE: u64, DocId: DocumentId>
     /// Reserves space for `docs` in the current page, first rotating to a new page when
     /// the current one is out of document slots, would hold more than `PAGE_SIZE` payload
     /// bytes (the fixed-size index is not counted), would push its `u32` payload offset
-    /// past `u32::MAX`, or has inconsistent offsets. A fresh page accepts its first batch
-    /// even when the batch alone exceeds `PAGE_SIZE`.
+    /// past `u32::MAX`, or has wrapped offsets (it is read-only). A fresh page accepts its
+    /// first batch even when the batch alone exceeds `PAGE_SIZE`.
     pub fn reserve_space_for<'docs, Doc: Document>(
         &mut self,
         docs: &'docs [(DocId, Doc)],
@@ -168,10 +168,17 @@ impl<const MAX_DOC_PER_PAGE: u32, const PAGE_SIZE: u64, DocId: DocumentId>
             let out_of_slots = remain < document_count;
             let over_page_size = used_slots > 0 && payload_end > PAGE_SIZE;
             let over_offset_limit = batch_end > u32::MAX as u64;
-            let inconsistent =
-                Self::has_inconsistent_offsets(current_page_id, page, next_offset, header_size)?;
+            let wrapped = page.has_wrapped_offsets()?;
+            if wrapped {
+                tracing::warn!(
+                    page_id = current_page_id,
+                    next_offset,
+                    header_size,
+                    "Page next-write offset wrapped; the page is read-only, rotating to a new page"
+                );
+            }
 
-            if out_of_slots || over_page_size || over_offset_limit || inconsistent {
+            if out_of_slots || over_page_size || over_offset_limit || wrapped {
                 page.close()?;
                 self.current_page = None;
             }
@@ -188,43 +195,49 @@ impl<const MAX_DOC_PER_PAGE: u32, const PAGE_SIZE: u64, DocId: DocumentId>
         Ok(reserved_page)
     }
 
-    /// A healthy page's next-write offset equals its file length (or exceeds it while a
-    /// reservation is still being written). An offset below the file length or inside the
-    /// index means the offset wrapped: writing there would overwrite existing payloads,
-    /// so such a page must never be written to again.
-    fn has_inconsistent_offsets(
-        page_id: u64,
-        page: &ZeboPage,
-        next_offset: u64,
-        header_size: u64,
-    ) -> Result<bool> {
-        let file_len = page.file_len()?;
-        let inconsistent = next_offset < file_len || next_offset < header_size;
-        if inconsistent {
-            tracing::warn!(
-                page_id,
-                next_offset,
-                file_len,
-                header_size,
-                "Page next-write offset is inconsistent with its file length; rotating to a new page"
-            );
-        }
-        Ok(inconsistent)
-    }
-
-    /// Removes documents associated to the given ids
+    /// Removes documents associated to the given ids and returns how many were live.
+    /// Deletions on a read-only (wrapped) page are recorded in its sidecar file; once a
+    /// read-only page has no live document left, the page is removed (except the highest
+    /// page, which keeps the last inserted id).
     pub fn remove_documents(&mut self, doc_ids: Vec<DocId>, clean_data: bool) -> Result<u32> {
         self.remove_documents_cache.clear();
         self.index
             .get_pages(doc_ids, &mut self.remove_documents_cache)?;
 
         let mut removed = 0;
+        let mut emptied_pages = Vec::new();
         for (page_id, documents_to_delete) in &self.remove_documents_cache {
             let mut page = load_page(&self.base_dir, *page_id, Mode::Change)?;
             removed += page.delete_documents(documents_to_delete, clean_data)?;
+            if page.is_read_only() && page.get_document_count()? == 0 {
+                emptied_pages.push(*page_id);
+            }
+        }
+        // The highest page is never removed: `get_last_inserted_document_id` reads the id
+        // watermark from it, and callers seed new ids from that value.
+        let highest_page_id = self.index.get_page_ids()?.into_iter().max();
+        for page_id in emptied_pages {
+            if Some(page_id) == highest_page_id {
+                continue;
+            }
+            self.remove_page(page_id)?;
         }
 
         Ok(removed)
+    }
+
+    /// Removes a page: drops it from the index (other pages keep their ids), then deletes
+    /// its page file and sidecar. A crash in between leaves only unreferenced files.
+    fn remove_page(&mut self, page_id: PageId) -> Result<()> {
+        self.index.remove_page(page_id)?;
+        if self.current_page.is_some() && self.next_page_id.checked_sub(1) == Some(page_id.0) {
+            self.current_page = None;
+        }
+
+        let page_path = page_path(&self.base_dir, page_id);
+        remove_file_if_exists(&sidecar_path(&page_path))?;
+        remove_file_if_exists(&page_path)?;
+        sync_dir(&self.base_dir)
     }
 
     /// Compacts all pages except the current one by rewriting them to reclaim
@@ -253,6 +266,10 @@ impl<const MAX_DOC_PER_PAGE: u32, const PAGE_SIZE: u64, DocId: DocumentId>
             }
 
             let page = load_page(&self.base_dir, page_id, Mode::Read)?;
+            if page.is_read_only() {
+                stats.pages_skipped += 1;
+                continue;
+            }
 
             // Check if compaction would reclaim space: compare actual file size
             // against header size + total live document data
@@ -296,12 +313,7 @@ impl<const MAX_DOC_PER_PAGE: u32, const PAGE_SIZE: u64, DocId: DocumentId>
                     std::fs::rename(&temp_path, &original_path)
                         .map_err(ZeboError::OperationError)?;
 
-                    #[cfg(unix)]
-                    {
-                        let dir = std::fs::File::open(&self.base_dir)
-                            .map_err(ZeboError::OperationError)?;
-                        dir.sync_all().map_err(ZeboError::OperationError)?;
-                    }
+                    sync_dir(&self.base_dir)?;
 
                     stats.total_bytes_reclaimed += page_stats
                         .bytes_before
@@ -412,8 +424,8 @@ impl<const MAX_DOC_PER_PAGE: u32, const PAGE_SIZE: u64, DocId: DocumentId>
     /// Returns the total document count
     pub fn get_document_count(&self) -> Result<u32> {
         let mut total_count = 0;
-        for page_id in 0..self.next_page_id {
-            let page = load_page(&self.base_dir, PageId(page_id), Mode::Read)?;
+        for page_id in self.index.get_page_ids()? {
+            let page = load_page(&self.base_dir, page_id, Mode::Read)?;
             total_count += page.get_document_count()?;
         }
 
@@ -455,7 +467,9 @@ impl<const MAX_DOC_PER_PAGE: u32, const PAGE_SIZE: u64, DocId: DocumentId>
         let new_page_id = PageId(self.next_page_id);
         self.index.new_page(doc_id, new_page_id)?;
 
-        let page_file_path = self.base_dir.join(format!("page_{}.zebo", new_page_id.0));
+        let page_file_path = page_path(&self.base_dir, new_page_id);
+        // A removed page's id can be reused after a restart: drop its stale sidecar.
+        remove_file_if_exists(&sidecar_path(&page_file_path))?;
         let page_file = std::fs::File::options()
             .create(true)
             .write(true)
@@ -505,9 +519,30 @@ impl<const MAX_DOC_PER_PAGE: u32, const PAGE_SIZE: u64, DocId: DocumentId>
     }
 }
 
+fn page_path(base_dir: &Path, page_id: PageId) -> PathBuf {
+    base_dir.join(format!("page_{}.zebo", page_id.0))
+}
+
+fn remove_file_if_exists(path: &Path) -> Result<()> {
+    match std::fs::remove_file(path) {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(ZeboError::OperationError(e)),
+        _ => Ok(()),
+    }
+}
+
+/// Persists file creations, renames and removals inside `dir`.
+pub(crate) fn sync_dir(dir: &Path) -> Result<()> {
+    #[cfg(unix)]
+    std::fs::File::open(dir)
+        .and_then(|dir| dir.sync_all())
+        .map_err(ZeboError::OperationError)?;
+    #[cfg(not(unix))]
+    let _ = dir;
+    Ok(())
+}
+
 fn load_page(base_dir: &Path, page_id: PageId, mode: Mode) -> Result<ZeboPage> {
-    // close page and create a new one
-    let page_file_path = base_dir.join(format!("page_{}.zebo", page_id.0));
+    let page_file_path = page_path(base_dir, page_id);
 
     let mut options = std::fs::File::options();
     match mode {
@@ -530,7 +565,7 @@ fn load_page(base_dir: &Path, page_id: PageId, mode: Mode) -> Result<ZeboPage> {
         }
     };
 
-    ZeboPage::try_load(page_file)
+    ZeboPage::try_load(page_file, sidecar_path(&page_file_path))
 }
 
 #[cfg_attr(coverage_nightly, coverage(off))]
@@ -538,13 +573,6 @@ impl<const MAX_DOC_PER_PAGE: u32, const PAGE_SIZE: u64, DocId: DocumentId> Debug
     for Zebo<MAX_DOC_PER_PAGE, PAGE_SIZE, DocId>
 {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let mut headers = Vec::new();
-        for page_id in 0..self.next_page_id {
-            let page =
-                load_page(&self.base_dir, PageId(page_id), Mode::Read).expect("Cannot open page");
-            headers.push(page.get_header().expect("Cannot get page header"));
-        }
-
         f.debug_struct("Zebo")
             .field("base_dir", &self.base_dir)
             .field("info", &self.get_info().expect("Cannot get info"))
@@ -1017,6 +1045,7 @@ mod tests {
         );
 
         assert_eq!(zebo.get_document_count().unwrap(), 4);
+        assert!(!test_dir.join("page_0.deleted").exists());
     }
 
     #[test]
@@ -1971,6 +2000,203 @@ mod tests {
         assert!(!test_dir.join("page_0.zebo.compact_tmp").exists());
         assert_eq!(zebo.get_document(2).unwrap(), None);
         assert_eq!(zebo.get_document(3).unwrap().unwrap(), b"doc");
+    }
+
+    /// Fakes a wrapped page: its next-write offset points back into its first payload.
+    fn wrap_page(path: &Path, document_limit: u32) {
+        seed_next_available_offset(path, ZeboPage::header_size(document_limit) as u32 + 1);
+    }
+
+    /// Checks every read path reports exactly `live` among the ids in `all`.
+    fn assert_live_documents<const M: u32, const P: u64>(
+        zebo: &Zebo<M, P, u64>,
+        all: std::ops::RangeInclusive<u64>,
+        live: &[u64],
+    ) {
+        let mut found: Vec<u64> = zebo
+            .get_documents(all.clone())
+            .unwrap()
+            .map(|doc| doc.unwrap().0)
+            .collect();
+        found.sort();
+        assert_eq!(found, live);
+
+        let mut found: Vec<u64> = zebo
+            .get_all_documents()
+            .unwrap()
+            .map(|doc| doc.unwrap().0)
+            .collect();
+        found.sort();
+        assert_eq!(found, live);
+
+        for id in all {
+            assert_eq!(zebo.get_document(id).unwrap().is_some(), live.contains(&id));
+        }
+        assert_eq!(zebo.get_document_count().unwrap() as usize, live.len());
+        assert_eq!(zebo.get_info().unwrap().document_count as usize, live.len());
+    }
+
+    #[test]
+    fn wrapped_page_deletes_go_to_sidecar() {
+        let test_dir = prepare_test_dir();
+        let page_path = test_dir.join("page_0.zebo");
+        let sidecar = test_dir.join("page_0.deleted");
+
+        let mut zebo = Zebo::<5, { 1024 * 1024 }, u64>::try_new(&test_dir).unwrap();
+        zebo.reserve_space_for(&[
+            (1, "one"),
+            (2, "two"),
+            (3, "three"),
+            (4, "four"),
+            (5, "five"),
+        ])
+        .unwrap()
+        .write_all()
+        .unwrap();
+        zebo.reserve_space_for(&[(6_u64, "six")])
+            .unwrap()
+            .write_all()
+            .unwrap();
+        drop(zebo);
+        wrap_page(&page_path, 5);
+        let page_before = std::fs::read(&page_path).unwrap();
+
+        let mut zebo = Zebo::<5, { 1024 * 1024 }, u64>::try_new(&test_dir).unwrap();
+        assert_eq!(zebo.remove_documents(vec![2], true).unwrap(), 1);
+        assert_eq!(zebo.remove_documents(vec![4], false).unwrap(), 1);
+        // Already in the sidecar: not found again.
+        assert_eq!(zebo.remove_documents(vec![2, 4], true).unwrap(), 0);
+        // Page 0 is not the current page, so only being read-only keeps it uncompacted.
+        assert_eq!(zebo.compact().unwrap().pages_compacted, 0);
+
+        assert_eq!(std::fs::read(&page_path).unwrap(), page_before);
+        assert_eq!(std::fs::metadata(&sidecar).unwrap().len(), 16);
+        assert_live_documents(&zebo, 1..=6, &[1, 3, 5, 6]);
+        assert_eq!(zebo.get_document(3).unwrap().unwrap(), b"three");
+        drop(zebo);
+
+        let zebo = Zebo::<5, { 1024 * 1024 }, u64>::try_new(&test_dir).unwrap();
+        assert_live_documents(&zebo, 1..=6, &[1, 3, 5, 6]);
+        assert_eq!(std::fs::read(&page_path).unwrap(), page_before);
+    }
+
+    #[test]
+    fn emptied_read_only_page_is_removed() {
+        let test_dir = prepare_test_dir();
+        let page_path = test_dir.join("page_0.zebo");
+        let sidecar = test_dir.join("page_0.deleted");
+
+        let mut zebo = Zebo::<3, { 1024 * 1024 }, u64>::try_new(&test_dir).unwrap();
+        zebo.reserve_space_for(&[(1, "one"), (2, "two"), (3, "three")])
+            .unwrap()
+            .write_all()
+            .unwrap();
+        zebo.reserve_space_for(&[(4, "four"), (5, "five")])
+            .unwrap()
+            .write_all()
+            .unwrap();
+        drop(zebo);
+        wrap_page(&page_path, 3);
+
+        let mut zebo = Zebo::<3, { 1024 * 1024 }, u64>::try_new(&test_dir).unwrap();
+        assert_eq!(zebo.remove_documents(vec![1, 2], false).unwrap(), 2);
+        assert!(page_path.exists());
+        assert_eq!(zebo.remove_documents(vec![3], true).unwrap(), 1);
+
+        assert!(!page_path.exists());
+        assert!(!sidecar.exists());
+        assert_eq!(zebo.get_all_pages().unwrap(), vec![(4, PageId(1))]);
+        assert_live_documents(&zebo, 1..=5, &[4, 5]);
+        drop(zebo);
+
+        let mut zebo = Zebo::<3, { 1024 * 1024 }, u64>::try_new(&test_dir).unwrap();
+        assert_live_documents(&zebo, 1..=5, &[4, 5]);
+        zebo.reserve_space_for(&[(6_u64, "six")])
+            .unwrap()
+            .write_all()
+            .unwrap();
+        assert_live_documents(&zebo, 1..=6, &[4, 5, 6]);
+    }
+
+    #[test]
+    fn emptied_read_only_last_page_is_kept_as_id_watermark() {
+        let test_dir = prepare_test_dir();
+        let page_path = test_dir.join("page_1.zebo");
+
+        let mut zebo = Zebo::<3, { 1024 * 1024 }, u64>::try_new(&test_dir).unwrap();
+        zebo.reserve_space_for(&[(1, "one"), (2, "two"), (3, "three")])
+            .unwrap()
+            .write_all()
+            .unwrap();
+        zebo.reserve_space_for(&[(4, "four"), (5, "five")])
+            .unwrap()
+            .write_all()
+            .unwrap();
+        drop(zebo);
+        wrap_page(&page_path, 3);
+        let original = std::fs::read(&page_path).unwrap();
+
+        // The wrapped page is the highest page: emptied, it stays so the id watermark survives.
+        let mut zebo = Zebo::<3, { 1024 * 1024 }, u64>::try_new(&test_dir).unwrap();
+        assert_eq!(zebo.remove_documents(vec![4, 5], false).unwrap(), 2);
+        assert_eq!(std::fs::read(&page_path).unwrap(), original);
+        assert_live_documents(&zebo, 1..=5, &[1, 2, 3]);
+        drop(zebo);
+
+        // After a restart the last inserted id is still 5, and new documents go to a new page.
+        let mut zebo = Zebo::<3, { 1024 * 1024 }, u64>::try_new(&test_dir).unwrap();
+        assert_eq!(zebo.get_last_inserted_document_id().unwrap(), Some(5));
+        zebo.reserve_space_for(&[(6_u64, "six")])
+            .unwrap()
+            .write_all()
+            .unwrap();
+        assert_eq!(std::fs::read(&page_path).unwrap(), original);
+        assert_live_documents(&zebo, 1..=6, &[1, 2, 3, 6]);
+    }
+
+    #[test]
+    fn torn_sidecar_record_is_ignored() {
+        let test_dir = prepare_test_dir();
+        let page_path = test_dir.join("page_0.zebo");
+        let sidecar = test_dir.join("page_0.deleted");
+
+        let mut zebo = Zebo::<5, { 1024 * 1024 }, u64>::try_new(&test_dir).unwrap();
+        zebo.reserve_space_for(&[
+            (1, "one"),
+            (2, "two"),
+            (3, "three"),
+            (4, "four"),
+            (5, "five"),
+        ])
+        .unwrap()
+        .write_all()
+        .unwrap();
+        zebo.reserve_space_for(&[(6_u64, "six")])
+            .unwrap()
+            .write_all()
+            .unwrap();
+        drop(zebo);
+        wrap_page(&page_path, 5);
+
+        let mut zebo = Zebo::<5, { 1024 * 1024 }, u64>::try_new(&test_dir).unwrap();
+        zebo.remove_documents(vec![2], false).unwrap();
+        drop(zebo);
+        let mut file = std::fs::File::options()
+            .append(true)
+            .open(&sidecar)
+            .unwrap();
+        file.write_all(&[0, 0, 3]).unwrap();
+        drop(file);
+
+        let mut zebo = Zebo::<5, { 1024 * 1024 }, u64>::try_new(&test_dir).unwrap();
+        assert_live_documents(&zebo, 1..=6, &[1, 3, 4, 5, 6]);
+        // The next append first cuts the torn record off.
+        assert_eq!(zebo.remove_documents(vec![3], false).unwrap(), 1);
+        assert_eq!(std::fs::metadata(&sidecar).unwrap().len(), 16);
+        drop(zebo);
+
+        let zebo = Zebo::<5, { 1024 * 1024 }, u64>::try_new(&test_dir).unwrap();
+        assert_live_documents(&zebo, 1..=6, &[1, 4, 5, 6]);
     }
 
     struct MyDoc {
