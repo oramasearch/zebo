@@ -1,4 +1,4 @@
-use std::{fs::File, io::Write};
+use std::{fs::File, io::Write, ops::ControlFlow};
 
 use positioned_io::{ReadAt, WriteAt};
 
@@ -13,6 +13,11 @@ pub const NEXT_AVAILABLE_OFFSET: u64 = DOCUMENT_COUNT_OFFSET + 4;
 pub const NEXT_AVAILABLE_HEADER_OFFSET: u64 = NEXT_AVAILABLE_OFFSET + 4;
 pub const STARTING_DOCUMENT_ID_OFFSET: u64 = NEXT_AVAILABLE_HEADER_OFFSET + 4;
 pub const DOCUMENT_INDEX_OFFSET: u64 = STARTING_DOCUMENT_ID_OFFSET + 8;
+
+/// Bytes read per syscall when scanning the index (4096 slots).
+const INDEX_SCAN_CHUNK: u64 = 64 * 1024;
+/// Slots the fallback walk visits before handing off to a range search.
+const FALLBACK_WALK_LIMIT: u64 = 1024;
 
 // 1
 // 12234556
@@ -52,6 +57,9 @@ pub struct ZeboPage {
     pub(crate) starting_document_id: u64,
     pub(crate) page_file: std::fs::File,
     pub(crate) next_available_header_offset: u32,
+    /// Index read syscalls issued by this page, so tests can bound scan costs.
+    #[cfg(test)]
+    index_reads: std::sync::atomic::AtomicU64,
 }
 
 impl ZeboPage {
@@ -116,6 +124,8 @@ impl ZeboPage {
             starting_document_id,
             page_file,
             next_available_header_offset: 0,
+            #[cfg(test)]
+            index_reads: Default::default(),
         };
 
         Ok(s)
@@ -157,6 +167,8 @@ impl ZeboPage {
             document_limit,
             starting_document_id,
             next_available_header_offset,
+            #[cfg(test)]
+            index_reads: Default::default(),
         })
     }
 
@@ -165,16 +177,14 @@ impl ZeboPage {
     }
 
     pub fn live_data_size(&self) -> Result<u64> {
+        let scan_end = self.scan_end(self.file_len()?)?;
         let mut total: u64 = 0;
-        for i in 0..self.next_available_header_offset as u64 {
-            if let Some((doc_id, offset, length)) = self.get_at(i)? {
-                if Self::is_uninitialized_entry(offset) || Self::is_deleted(doc_id, offset, length)
-                {
-                    continue;
-                }
+        self.scan_index(0, scan_end, |_, (doc_id, offset, length)| {
+            if !Self::is_uninitialized_entry(offset) && !Self::is_deleted(doc_id, offset, length) {
                 total += length as u64;
             }
-        }
+            ControlFlow::<()>::Continue(())
+        })?;
         Ok(total)
     }
 
@@ -207,10 +217,69 @@ impl ZeboPage {
             .len())
     }
 
-    /// End (exclusive) of the index slots that may hold entries: slots past the
-    /// next available header offset were never reserved.
-    fn index_end(&self) -> u64 {
-        self.next_available_header_offset.min(self.document_limit) as u64
+    /// A healthy page's next-write offset equals its file length (or exceeds it while a
+    /// reservation is still being written). An offset below the file length or inside the
+    /// index means the offset wrapped and later writes overwrote existing bytes.
+    pub(crate) fn has_inconsistent_offsets(&self, next_offset: u64, file_len: u64) -> bool {
+        next_offset < file_len || next_offset < Self::header_size(self.document_limit)
+    }
+
+    /// End (exclusive) of the slots a scan may read: the reserved slots, capped by the
+    /// slots whose 16 bytes lie entirely inside a file of `file_len` bytes. Legacy pages
+    /// may hold reserved slots past `document_limit`; those entries are kept findable,
+    /// and `is_payload_in_bounds` rejects any that point at garbage. A page with
+    /// inconsistent offsets may have a garbage slot count too, so it is capped at
+    /// `document_limit`.
+    pub(crate) fn scan_end(&self, file_len: u64) -> Result<u64> {
+        let file_slots = file_len.saturating_sub(DOCUMENT_INDEX_OFFSET) / 16;
+        let next_offset = self.get_next_available_document_offset()? as u64;
+        let reserved = if self.has_inconsistent_offsets(next_offset, file_len) {
+            self.next_available_header_offset.min(self.document_limit)
+        } else {
+            self.next_available_header_offset
+        };
+        Ok((reserved as u64).min(file_slots))
+    }
+
+    /// Calls `f(slot, (doc_id, offset, len))` for every slot in `start..end`, reading the
+    /// index in `INDEX_SCAN_CHUNK`-byte chunks. Stops early when `f` returns
+    /// `ControlFlow::Break`, returning its value. `end` must not exceed `scan_end`.
+    fn scan_index<B>(
+        &self,
+        start: u64,
+        end: u64,
+        mut f: impl FnMut(u64, (u64, u32, u32)) -> ControlFlow<B>,
+    ) -> Result<Option<B>> {
+        let chunk_slots = INDEX_SCAN_CHUNK / 16;
+        let mut buf = vec![0_u8; (end.saturating_sub(start).min(chunk_slots) * 16) as usize];
+        let mut slot = start;
+        while slot < end {
+            let chunk = &mut buf[..((end - slot).min(chunk_slots) * 16) as usize];
+            self.count_index_read();
+            self.page_file
+                .read_exact_at(DOCUMENT_INDEX_OFFSET + slot * 16, chunk)
+                .map_err(ZeboError::OperationError)?;
+            for entry in chunk.as_chunks::<16>().0 {
+                if let ControlFlow::Break(b) = f(slot, Self::decode_entry(entry)) {
+                    return Ok(Some(b));
+                }
+                slot += 1;
+            }
+        }
+        Ok(None)
+    }
+
+    /// Decodes a 16-byte index entry into `(doc_id, offset, len)`.
+    fn decode_entry(entry: &[u8; 16]) -> (u64, u32, u32) {
+        let entry = u128::from_be_bytes(*entry);
+        ((entry >> 64) as u64, (entry >> 32) as u32, entry as u32)
+    }
+
+    #[inline]
+    fn count_index_read(&self) {
+        #[cfg(test)]
+        self.index_reads
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Whether the payload an index entry points at lies inside the data region of a
@@ -251,31 +320,17 @@ impl ZeboPage {
     /// Returns the maximum document ID in this page, including deleted documents.
     /// Returns None if no documents have ever been added to this page.
     pub fn get_max_document_id(&self) -> Result<Option<u64>> {
+        let scan_end = self.scan_end(self.file_len()?)?;
         let mut max_doc_id: Option<u64> = None;
 
-        for i in 0..self.document_limit {
-            if let Some((doc_id, offset, _len)) = self.get_at(i as u64)? {
-                // Skip uninitialized entries
-                if Self::is_uninitialized_entry(offset) {
-                    continue;
-                }
-
-                // Skip old-format deletions (doc_id = u64::MAX)
-                // but include new-format deletions (preserved doc_id)
-                if doc_id == u64::MAX {
-                    continue;
-                }
-
-                match max_doc_id {
-                    None => max_doc_id = Some(doc_id),
-                    Some(current_max) => {
-                        if doc_id > current_max {
-                            max_doc_id = Some(doc_id);
-                        }
-                    }
-                }
+        self.scan_index(0, scan_end, |_, (doc_id, offset, _len)| {
+            // Skip uninitialized entries and old-format deletions (doc_id = u64::MAX),
+            // but include new-format deletions (preserved doc_id)
+            if !Self::is_uninitialized_entry(offset) && doc_id != u64::MAX {
+                max_doc_id = max_doc_id.max(Some(doc_id));
             }
-        }
+            ControlFlow::<()>::Continue(())
+        })?;
 
         Ok(max_doc_id)
     }
@@ -283,31 +338,24 @@ impl ZeboPage {
     pub fn get_header(&self) -> Result<ZeboPageHeader> {
         let document_count = self.get_document_count()?;
         let next_available_document_offset = self.get_next_available_document_offset()?;
+        let scan_end = self.scan_end(self.file_len()?)?;
 
-        let mut doc_index = Vec::with_capacity(document_count as usize);
-        let mut found = 0;
-        let mut i: u64 = 0;
-        while found < document_count {
-            if i > (self.document_limit as u64) {
-                break;
-            }
-
-            if let Some((doc_id, document_offset, document_len)) = self.get_at(i)? {
+        // The stored count is informational and may be garbage: never size by it alone.
+        let mut doc_index = Vec::with_capacity(scan_end.min(document_count as u64) as usize);
+        if document_count > 0 {
+            self.scan_index(0, scan_end, |_, (doc_id, document_offset, document_len)| {
                 // Reached uninitialized entries
                 if Self::is_uninitialized_entry(document_offset) {
-                    break;
+                    return ControlFlow::Break(());
                 }
-                // this document is deleted
-                if Self::is_deleted(doc_id, document_offset, document_len) {
-                    i += 1;
-                    continue;
+                if !Self::is_deleted(doc_id, document_offset, document_len) {
+                    doc_index.push((doc_id, document_offset, document_len));
+                    if doc_index.len() >= document_count as usize {
+                        return ControlFlow::Break(());
+                    }
                 }
-
-                doc_index.push((doc_id, document_offset, document_len));
-                found += 1;
-            }
-
-            i += 1;
+                ControlFlow::Continue(())
+            })?;
         }
 
         let header = ZeboPageHeader {
@@ -332,15 +380,16 @@ impl ZeboPage {
 
         let mut r = Vec::with_capacity(doc_id_with_index.len());
         let file_len = self.file_len()?;
+        let scan_end = self.scan_end(file_len)?;
         let mut out_of_bounds = OutOfBoundsEntries::default();
+
+        if scan_end == 0 {
+            return Ok(r);
+        }
 
         for (doc_id, probable_index) in doc_id_with_index {
             // Try to get data at probable index if it's within bounds
-            let mut probable_index = *probable_index;
-
-            if probable_index.0 >= self.next_available_header_offset as u64 {
-                probable_index.0 = self.next_available_header_offset.saturating_sub(1) as u64;
-            }
+            let probable_index = ProbableIndex(probable_index.0.min(scan_end - 1));
 
             let (found_id, document_offset, document_len) =
                 self.read_index_entry(probable_index.0)?;
@@ -355,25 +404,26 @@ impl ZeboPage {
                 Some((document_offset, document_len))
             } else {
                 // We need to apply a fallback logic
-                let mut probable_index = if *doc_id > found_id {
+                let probable_index = if *doc_id > found_id {
                     // The wanted document is after the found document
                     // We know it because the document IDs are in ascending order
                     let delta = doc_id - found_id;
-                    ProbableIndex(probable_index.0 + delta)
+                    ProbableIndex(probable_index.0.saturating_add(delta))
                 } else {
                     // The wanted document is before the found document
                     // We know it because the document IDs are in ascending order
                     let delta = found_id - doc_id;
                     ProbableIndex(probable_index.0.saturating_sub(delta))
                 };
-
-                if probable_index.0 >= self.next_available_header_offset as u64 {
-                    probable_index.0 = self.next_available_header_offset.saturating_sub(1) as u64;
-                }
+                let probable_index = ProbableIndex(probable_index.0.min(scan_end - 1));
 
                 let hint = self.read_index_entry(probable_index.0)?;
 
-                match self.fallback_search_document(*doc_id, Some((probable_index.0, hint))) {
+                match self.fallback_search_document(
+                    *doc_id,
+                    Some((probable_index.0, hint)),
+                    scan_end,
+                ) {
                     Ok(Some((_, document_offset, document_len))) => {
                         Some((document_offset, document_len))
                     }
@@ -414,22 +464,21 @@ impl ZeboPage {
     }
 
     /// Reads the raw index entry `(doc_id, offset, len)` stored at slot `index`.
+    /// The caller keeps `index` below `scan_end`.
     fn read_index_entry(&self, index: u64) -> Result<(u64, u32, u32)> {
         let mut buff = [0; 16];
+        self.count_index_read();
         self.page_file
             .read_exact_at(DOCUMENT_INDEX_OFFSET + (index * (4 + 4 + 8)), &mut buff)
             .map_err(ZeboError::OperationError)?;
-        let doc_id = u64::from_be_bytes([
-            buff[0], buff[1], buff[2], buff[3], buff[4], buff[5], buff[6], buff[7],
-        ]);
-        let document_offset = u32::from_be_bytes([buff[8], buff[9], buff[10], buff[11]]);
-        let document_len = u32::from_be_bytes([buff[12], buff[13], buff[14], buff[15]]);
-        Ok((doc_id, document_offset, document_len))
+        Ok(Self::decode_entry(&buff))
     }
 
     /// Reserves index slots and payload bytes for `documents` and persists the new
-    /// offsets. Fails with `NotEnoughSpace` or `TooManyDocuments`, without touching the
-    /// file, when the page cannot address the batch (offsets are `u32`).
+    /// offsets. Fails without touching the file with `NotEnoughSpace` when the payload
+    /// offset would pass `u32::MAX`, and with `TooManyDocuments` when the batch needs
+    /// slots past `document_limit`. The stored document count is informational: it
+    /// saturates and never fails a reservation.
     pub fn reserve<'docs, DocId: DocumentId, Doc: Document>(
         &mut self,
         documents: &'docs [(DocId, Doc)],
@@ -471,9 +520,7 @@ impl ZeboPage {
             .checked_add(document_count)
             .filter(|end| *end <= self.document_limit)
             .ok_or_else(too_many_documents)?;
-        let new_document_count = current_document_count
-            .checked_add(document_count)
-            .ok_or_else(too_many_documents)?;
+        let new_document_count = current_document_count.saturating_add(document_count);
 
         self.next_available_header_offset = new_next_available_header_offset;
 
@@ -554,40 +601,37 @@ impl ZeboPage {
             }
         }
 
-        let mut found = 0_u32;
-        let mut buf = [0; 16];
-        // Iterate over the header and erase the index
-        // High inefficiency, but we don't care
-        for i in 0..self.document_limit {
-            let (doc_id, offset, _) = match self.get_at(i as u64)? {
-                Some(x) => x,
-                None => continue,
-            };
-            // No data in the header - uninitialized entry
-            if Self::is_uninitialized_entry(offset) {
-                continue;
+        // Collect the live slots to erase, then mark them
+        let scan_end = self.scan_end(self.file_len()?)?;
+        let mut to_mark = vec![];
+        self.scan_index(0, scan_end, |i, (doc_id, offset, _)| {
+            // Skip uninitialized entries and already deleted documents
+            if !Self::is_uninitialized_entry(offset)
+                && offset != u32::MAX
+                && documents_to_delete.iter().any(|(d, _)| *d == doc_id)
+            {
+                to_mark.push((i, doc_id));
             }
-            // This document is already deleted
-            if offset == u32::MAX {
-                continue;
-            }
-            if documents_to_delete.iter().any(|(d, _)| *d == doc_id) {
-                // Keep the document ID but mark offset and length as deleted
-                buf[0..8].copy_from_slice(&doc_id.to_be_bytes());
-                buf[8..12].copy_from_slice(&u32::MAX.to_be_bytes());
-                buf[12..16].copy_from_slice(&u32::MAX.to_be_bytes());
-                self.page_file
-                    .write_all_at(DOCUMENT_INDEX_OFFSET + (i as u64 * (4 + 4 + 8)), &buf)
-                    .map_err(ZeboError::OperationError)?;
+            ControlFlow::<()>::Continue(())
+        })?;
 
-                found += 1;
-            }
+        let mut buf = [0; 16];
+        for (i, doc_id) in &to_mark {
+            // Keep the document ID but mark offset and length as deleted
+            buf[0..8].copy_from_slice(&doc_id.to_be_bytes());
+            buf[8..12].copy_from_slice(&u32::MAX.to_be_bytes());
+            buf[12..16].copy_from_slice(&u32::MAX.to_be_bytes());
+            self.page_file
+                .write_all_at(DOCUMENT_INDEX_OFFSET + (i * (4 + 4 + 8)), &buf)
+                .map_err(ZeboError::OperationError)?;
         }
+        let found = u32::try_from(to_mark.len()).unwrap_or(u32::MAX);
 
         if found > 0 {
-            // Update the document count
+            // Update the document count. It is informational and may already have
+            // drifted below the number of live entries: saturate, never wrap.
             let document_count = self.get_document_count()?;
-            let new_document_count = document_count - found;
+            let new_document_count = document_count.saturating_sub(found);
             self.page_file
                 .write_all_at(DOCUMENT_COUNT_OFFSET, &new_document_count.to_be_bytes())
                 .map_err(ZeboError::OperationError)?;
@@ -601,32 +645,12 @@ impl ZeboPage {
         Ok(found)
     }
 
-    fn get_at(&self, document_index: u64) -> Result<Option<(u64, u32, u32)>> {
-        // Slots run 0..document_limit; anything past that is payload, not index.
-        if document_index >= self.document_limit as u64 {
+    /// Reads slot `document_index`, or `None` when it lies at or past `scan_end`.
+    fn get_at(&self, document_index: u64, scan_end: u64) -> Result<Option<(u64, u32, u32)>> {
+        if document_index >= scan_end {
             return Ok(None);
         }
-
-        let mut buf = [0; 16];
-        if let Err(e) = self.page_file.read_exact_at(
-            DOCUMENT_INDEX_OFFSET + (document_index * (4 + 4 + 8)),
-            &mut buf,
-        ) {
-            if e.kind() == std::io::ErrorKind::UnexpectedEof {
-                // Reached the end of the file
-                return Ok(None);
-            }
-            return Err(ZeboError::OperationError(e));
-        }
-
-        let doc_id = u64::from_be_bytes([
-            buf[0], buf[1], buf[2], buf[3], buf[4], buf[5], buf[6], buf[7],
-        ]);
-
-        let document_offset = u32::from_be_bytes([buf[8], buf[9], buf[10], buf[11]]);
-        let document_len = u32::from_be_bytes([buf[12], buf[13], buf[14], buf[15]]);
-
-        Ok(Some((doc_id, document_offset, document_len)))
+        self.read_index_entry(document_index).map(Some)
     }
 
     /// Fallback document search algorithm for when probable index lookup fails
@@ -644,6 +668,7 @@ impl ZeboPage {
         &self,
         target_doc_id: u64,
         hint_data: Option<(u64, (u64, u32, u32))>,
+        scan_end: u64,
     ) -> Result<Option<(u64, u32, u32)>> {
         let (starting_index, starting_doc_id) = if let Some((index, (doc_id, offset, len))) =
             hint_data
@@ -666,18 +691,19 @@ impl ZeboPage {
                 return Ok(Some((doc_id, offset, len)));
             }
 
-            let document_count = self.next_available_header_offset as u64;
-            if document_count == 0 {
+            if scan_end == 0 {
                 return Ok(None);
             }
 
             let most_probable_index = if doc_id < target_doc_id {
-                (target_doc_id - doc_id + index).min(document_count - 1)
+                (target_doc_id - doc_id)
+                    .saturating_add(index)
+                    .min(scan_end - 1)
             } else {
                 index.saturating_sub(doc_id - target_doc_id)
             };
 
-            match self.get_at(most_probable_index)? {
+            match self.get_at(most_probable_index, scan_end)? {
                 None => {
                     // No data at the most probable index, so we start from the hint
                     (index, doc_id)
@@ -709,18 +735,17 @@ impl ZeboPage {
             //     Compare the distance between the first and last document ids
             //     Choose the closest one as the starting point
 
-            let document_count = self.next_available_header_offset;
-            if document_count == 0 {
+            if scan_end == 0 {
                 return Ok(None);
             }
 
             let first_doc_id = self.starting_document_id;
 
-            if document_count == 1 {
+            if scan_end == 1 {
                 (0, first_doc_id)
             } else {
-                let last_index = (document_count - 1) as u64;
-                match self.get_at(last_index)? {
+                let last_index = scan_end - 1;
+                match self.get_at(last_index, scan_end)? {
                     None => (0, first_doc_id),
                     Some((last_doc_id, _, _)) => {
                         let distance_from_first = target_doc_id.abs_diff(first_doc_id);
@@ -735,159 +760,127 @@ impl ZeboPage {
             }
         };
 
-        let delta: i32 = if starting_doc_id < target_doc_id {
-            1
+        if starting_index >= scan_end {
+            return self.find_in_range(target_doc_id, starting_index, 50, scan_end);
+        }
+
+        // Walk from the starting slot towards the target. On a sorted index the walk is
+        // proportional to the distance from the hint, so it reads at most
+        // FALLBACK_WALK_LIMIT slots (one chunk) before handing off to the range search.
+        let forward = starting_doc_id < target_doc_id;
+        let (walk_start, walk_end) = if forward {
+            (
+                starting_index,
+                starting_index
+                    .saturating_add(FALLBACK_WALK_LIMIT)
+                    .min(scan_end),
+            )
         } else {
-            -1
+            (
+                starting_index.saturating_sub(FALLBACK_WALK_LIMIT - 1),
+                starting_index + 1,
+            )
         };
+        let mut walk = Vec::with_capacity((walk_end - walk_start) as usize);
+        self.scan_index(walk_start, walk_end, |_, entry| {
+            walk.push(entry);
+            ControlFlow::<()>::Continue(())
+        })?;
+        if !forward {
+            walk.reverse();
+        }
 
-        let index_end = self.index_end();
-        let mut tries = 0;
-        let mut current_index = starting_index;
-        loop {
-            tries += 1;
-            // Slots at or past `index_end` were never reserved: stop there.
-            let entry = if current_index < index_end {
-                self.get_at(current_index)?
+        for (tries, &(doc_id, document_offset, document_len)) in walk.iter().enumerate() {
+            // CRITICAL FIX: Check if this entry is deleted/uninitialized BEFORE checking doc_id
+            // This prevents the algorithm from incorrectly stopping when it encounters
+            // a deleted entry that happens to have the target doc_id
+            if Self::is_uninitialized_entry(document_offset)
+                || Self::is_deleted(doc_id, document_offset, document_len)
+            {
+                // Skip deleted/uninitialized entries and continue searching
+                continue;
+            }
+
+            // Found a valid (non-deleted) entry - check if it matches our target
+            if doc_id == target_doc_id {
+                debug!(tries = ?tries, "Found after some retries");
+                return Ok(Some((doc_id, document_offset, document_len)));
+            }
+
+            let passed_target = if forward {
+                doc_id > target_doc_id
             } else {
-                None
+                doc_id < target_doc_id
             };
-            match entry {
-                None => {
-                    // Reached the end of the index without finding the document
-                    return self.find_in_range(target_doc_id, starting_index, 50);
-                }
-                Some((doc_id, document_offset, document_len)) => {
-                    // CRITICAL FIX: Check if this entry is deleted/uninitialized BEFORE checking doc_id
-                    // This prevents the algorithm from incorrectly stopping when it encounters
-                    // a deleted entry that happens to have the target doc_id
-                    if Self::is_uninitialized_entry(document_offset)
-                        || Self::is_deleted(doc_id, document_offset, document_len)
-                    {
-                        // Skip deleted/uninitialized entries and continue searching
-                        // We don't change direction here - just move to the next index
-                        let temp_current_index = current_index as i128 + delta as i128;
-                        if temp_current_index < 0 {
-                            break;
-                        }
-                        current_index = temp_current_index as u64;
-                        continue;
-                    }
-
-                    // Found a valid (non-deleted) entry - check if it matches our target
-                    if doc_id == target_doc_id {
-                        debug!(tries = ?tries, "Found after some retries");
-
-                        return Ok(Some((doc_id, document_offset, document_len)));
-                    }
-
-                    // Document ID doesn't match - determine search direction based on comparison
-                    let current_delta = if doc_id < target_doc_id { 1 } else { -1 };
-                    if current_delta != delta {
-                        // We have passed the target document in the sorted order
-                        // This means the target doesn't exist in this page
-                        // Anyway, we do a final range search around the starting index
-                        return self.find_in_range(target_doc_id, starting_index, 50);
-                    }
-
-                    let temp_current_index = current_index as i128 + current_delta as i128;
-                    if temp_current_index < 0 {
-                        break;
-                    }
-
-                    current_index = temp_current_index as u64;
-                }
+            if passed_target {
+                // We have passed the target document in the sorted order
+                // This means the target doesn't exist in this page
+                // Anyway, we do a final range search around the starting index
+                return self.find_in_range(target_doc_id, starting_index, 50, scan_end);
             }
         }
 
-        // Document not found
-        Ok(None)
+        if !forward && walk_start == 0 {
+            // Walked back to the first slot: every entry is past the target
+            return Ok(None);
+        }
+
+        // Reached the end of the index or the walk limit without finding the document
+        self.find_in_range(target_doc_id, starting_index, 50, scan_end)
     }
 
+    /// Searches the slots within `delta` of `index`, then the whole index.
     fn find_in_range(
         &self,
         target_doc_id: u64,
         index: u64,
         delta: u64,
+        scan_end: u64,
     ) -> Result<Option<(u64, u32, u32)>> {
         let starting_index = index.saturating_sub(delta);
-        let ending_index = index
-            .saturating_add(delta)
-            .saturating_add(1)
-            .min(self.index_end());
+        let ending_index = index.saturating_add(delta).saturating_add(1).min(scan_end);
 
-        let mut buf = [0; 16];
-        for i in starting_index..ending_index {
-            match self
-                .page_file
-                .read_exact_at(DOCUMENT_INDEX_OFFSET + (i * (4 + 4 + 8)), &mut buf)
-            {
-                Ok(_) => {}
-                Err(e) => {
-                    if e.kind() == std::io::ErrorKind::UnexpectedEof {
-                        // Reached the end of the file
-                        break;
-                    }
-                    return Err(ZeboError::OperationError(e));
-                }
-            };
-            let doc_id = u64::from_be_bytes([
-                buf[0], buf[1], buf[2], buf[3], buf[4], buf[5], buf[6], buf[7],
-            ]);
-            let document_offset = u32::from_be_bytes([buf[8], buf[9], buf[10], buf[11]]);
-            let document_len = u32::from_be_bytes([buf[12], buf[13], buf[14], buf[15]]);
-
-            if doc_id == target_doc_id {
-                if Self::is_uninitialized_entry(document_offset)
-                    || Self::is_deleted(doc_id, document_offset, document_len)
-                {
-                    return Ok(None);
-                }
-
+        match self.scan_index(starting_index, ending_index, |_, entry| {
+            Self::match_target(target_doc_id, entry)
+        })? {
+            Some(found) => {
                 debug!("Found in range search");
-                return Ok(Some((doc_id, document_offset, document_len)));
+                Ok(found)
             }
+            None => self.find_from_start(target_doc_id, scan_end),
         }
-
-        self.find_from_start(target_doc_id)
     }
 
-    /// Linear scan of the index from slot 0. It stops at the end of the reserved
-    /// slots, never reading payload bytes as index entries.
-    fn find_from_start(&self, target_doc_id: u64) -> Result<Option<(u64, u32, u32)>> {
-        let mut buf = [0; 16];
-        for i in 0..self.index_end() {
-            match self
-                .page_file
-                .read_exact_at(DOCUMENT_INDEX_OFFSET + (i * (4 + 4 + 8)), &mut buf)
-            {
-                Ok(_) => {
-                    let doc_id = u64::from_be_bytes([
-                        buf[0], buf[1], buf[2], buf[3], buf[4], buf[5], buf[6], buf[7],
-                    ]);
-                    let document_offset = u32::from_be_bytes([buf[8], buf[9], buf[10], buf[11]]);
-                    let document_len = u32::from_be_bytes([buf[12], buf[13], buf[14], buf[15]]);
-                    if doc_id == target_doc_id {
-                        if Self::is_uninitialized_entry(document_offset)
-                            || Self::is_deleted(doc_id, document_offset, document_len)
-                        {
-                            return Ok(None);
-                        } else {
-                            return Ok(Some((doc_id, document_offset, document_len)));
-                        }
-                    }
-                }
-                Err(e) => {
-                    if e.kind() == std::io::ErrorKind::UnexpectedEof {
-                        // Reached the end of the file
-                        break;
-                    }
-                    return Err(ZeboError::OperationError(e));
-                }
-            }
-        }
+    /// Linear scan of the index from slot 0. It stops at `scan_end`, never reading
+    /// payload bytes past the reserved slots as index entries.
+    fn find_from_start(
+        &self,
+        target_doc_id: u64,
+        scan_end: u64,
+    ) -> Result<Option<(u64, u32, u32)>> {
+        Ok(self
+            .scan_index(0, scan_end, |_, entry| {
+                Self::match_target(target_doc_id, entry)
+            })?
+            .flatten())
+    }
 
-        Ok(None)
+    /// Scan step for a lookup: breaks on the first entry for `target_doc_id`, with
+    /// `None` when that entry is deleted or uninitialized.
+    fn match_target(
+        target_doc_id: u64,
+        (doc_id, document_offset, document_len): (u64, u32, u32),
+    ) -> ControlFlow<Option<(u64, u32, u32)>> {
+        if doc_id != target_doc_id {
+            return ControlFlow::Continue(());
+        }
+        if Self::is_uninitialized_entry(document_offset)
+            || Self::is_deleted(doc_id, document_offset, document_len)
+        {
+            ControlFlow::Break(None)
+        } else {
+            ControlFlow::Break(Some((doc_id, document_offset, document_len)))
+        }
     }
 
     /// Writes a compacted copy of this page into `target_file`.
@@ -929,14 +922,21 @@ impl ZeboPage {
             )
             .map_err(ZeboError::OperationError)?;
 
+        if self.next_available_header_offset > self.document_limit {
+            // Legacy slots past the limit lie where the compacted payloads would go.
+            warn!(
+                next_available_header_offset = self.next_available_header_offset,
+                document_limit = self.document_limit,
+                "Not compacting a page with index entries past its document limit"
+            );
+            return Ok(None);
+        }
+        let scan_end = self.scan_end(bytes_before)?;
+
         let mut entry_buf = [0u8; 16];
-
-        for i in 0..self.next_available_header_offset as u64 {
-            let (doc_id, offset, length) = match self.get_at(i)? {
-                Some(v) => v,
-                None => continue,
-            };
-
+        // Copies one slot into `target_file`; `Ok(false)` means the page cannot be
+        // compacted safely.
+        let mut copy_slot = |i: u64, (doc_id, offset, length): (u64, u32, u32)| -> Result<bool> {
             let index_pos = DOCUMENT_INDEX_OFFSET + i * 16;
 
             if Self::is_uninitialized_entry(offset) {
@@ -963,11 +963,11 @@ impl ZeboPage {
                         file_len = bytes_before,
                         "Not compacting a page with an entry outside the page file"
                     );
-                    return Ok(None);
+                    return Ok(false);
                 }
                 let Some(next_cursor) = write_cursor.checked_add(length) else {
                     warn!("Not compacting a page whose live data exceeds u32 offsets");
-                    return Ok(None);
+                    return Ok(false);
                 };
                 if length > 0 {
                     let len = length as usize;
@@ -991,6 +991,18 @@ impl ZeboPage {
 
                 write_cursor = next_cursor;
             }
+            Ok(true)
+        };
+        // Break(None): not compactable; Break(Some(e)): I/O error.
+        let stopped = self.scan_index(0, scan_end, |i, entry| match copy_slot(i, entry) {
+            Ok(true) => ControlFlow::Continue(()),
+            Ok(false) => ControlFlow::Break(None),
+            Err(e) => ControlFlow::Break(Some(e)),
+        })?;
+        match stopped {
+            Some(Some(e)) => return Err(e),
+            Some(None) => return Ok(None),
+            None => {}
         }
 
         // Zero-fill remaining slots
@@ -1102,64 +1114,27 @@ impl ZeboPage {
         let starting_document_id = u64::from_be_bytes(buf);
         writeln!(writer, "Starting Document ID: {starting_document_id}").unwrap();
 
-        let mut offset = DOCUMENT_INDEX_OFFSET;
-        let mut doc_id = [0; 8];
-        let mut starting_offset = [0; 4];
-        let mut bytes_length = [0; 4];
+        let scan_end = self.scan_end(self.file_len()?)?;
         let mut docs: Vec<u8> = vec![];
-        let mut i = -1_i128;
-        loop {
-            i += 1;
-            if i > self.next_available_header_offset as i128 {
-                // Reach the end
-                break;
+        // Break(None): reached the end; Break(Some(e)): I/O error.
+        let stopped = self.scan_index(0, scan_end, |i, (doc_id, starting_offset, bytes_length)| {
+            if doc_id == 0 {
+                return ControlFlow::Break(None);
             }
-
-            self.page_file.read_exact_at(offset, &mut doc_id).unwrap();
-            if doc_id == [0; 8] {
-                break;
-            }
-            match self
-                .page_file
-                .read_exact_at(offset + 8, &mut starting_offset)
-            {
-                Ok(_) => {}
-                Err(e) => {
-                    if e.kind() == std::io::ErrorKind::UnexpectedEof {
-                        break;
-                    }
-                    return Err(ZeboError::OperationError(e));
-                }
-            };
-            match self.page_file.read_exact_at(offset + 12, &mut bytes_length) {
-                Ok(_) => {}
-                Err(e) => {
-                    if e.kind() == std::io::ErrorKind::UnexpectedEof {
-                        break;
-                    }
-                    return Err(ZeboError::OperationError(e));
-                }
-            };
-            let doc_id = u64::from_be_bytes(doc_id);
-
-            offset += 8 + 4 + 4;
 
             if let Some(wanted_doc_id) = wanted_doc_id
                 && doc_id != wanted_doc_id
             {
-                continue;
+                return ControlFlow::Continue(());
             }
             if let Some(starting_doc_id) = starting_doc_id
                 && doc_id < starting_doc_id
             {
-                continue;
+                return ControlFlow::Continue(());
             }
 
-            let starting_offset = u32::from_be_bytes(starting_offset);
-            let bytes_length = u32::from_be_bytes(bytes_length);
-
             if Self::is_uninitialized_entry(starting_offset) {
-                break; // reach the end
+                return ControlFlow::Break(None); // reach the end
             }
 
             if !skip_header_info {
@@ -1171,7 +1146,7 @@ impl ZeboPage {
             }
 
             if doc_id == u64::MAX {
-                break; // reach the end
+                return ControlFlow::Break(None); // reach the end
             }
 
             if bytes_length == u32::MAX || starting_offset == u32::MAX {
@@ -1189,9 +1164,9 @@ impl ZeboPage {
                     if let Err(e) = self.page_file.read_exact_at(starting_offset as u64, slice) {
                         if e.kind() == std::io::ErrorKind::UnexpectedEof {
                             writeln!(writer, "Document content: [incomplete data, expected length {bytes_length} bytes]").unwrap();
-                            continue;
+                            return ControlFlow::Continue(());
                         }
-                        return Err(ZeboError::OperationError(e));
+                        return ControlFlow::Break(Some(ZeboError::OperationError(e)));
                     }
                     let probable_index = ProbableIndex(doc_id - starting_document_id);
                     let output = self
@@ -1222,6 +1197,10 @@ impl ZeboPage {
                     }
                 }
             }
+            ControlFlow::Continue(())
+        })?;
+        if let Some(Some(e)) = stopped {
+            return Err(e);
         }
 
         Ok(())
@@ -1945,27 +1924,27 @@ mod tests {
 
         // Test searching for document near the end (950) - should start from end
         let result = page
-            .fallback_search_document(950, None)
+            .fallback_search_document(950, None, scan_end(&page))
             .expect("Search failed");
         assert!(result.is_some());
         assert_eq!(result.unwrap().0, 950);
 
         // Test searching for document near the beginning (100) - should start from beginning
         let result = page
-            .fallback_search_document(100, None)
+            .fallback_search_document(100, None, scan_end(&page))
             .expect("Search failed");
         assert!(result.is_some());
         assert_eq!(result.unwrap().0, 100);
 
         // Test searching for non-existent document closer to end (940)
         let result = page
-            .fallback_search_document(940, None)
+            .fallback_search_document(940, None, scan_end(&page))
             .expect("Search failed");
         assert!(result.is_none());
 
         // Test searching for non-existent document closer to beginning (150)
         let result = page
-            .fallback_search_document(150, None)
+            .fallback_search_document(150, None, scan_end(&page))
             .expect("Search failed");
         assert!(result.is_none());
     }
@@ -2098,7 +2077,9 @@ mod tests {
         assert_eq!(docs[4], (5, b"ccccc".to_vec()));
 
         for doc_id in 1..=5 {
-            let docs = page.fallback_search_document(doc_id, None).unwrap();
+            let docs = page
+                .fallback_search_document(doc_id, None, scan_end(&page))
+                .unwrap();
             assert!(docs.is_some());
         }
     }
@@ -2162,7 +2143,7 @@ mod tests {
         assert_eq!(docs[4], (5, b"ccccc".to_vec()));
 
         for doc_id in 1..=5 {
-            let docs = page.find_from_start(doc_id).unwrap();
+            let docs = page.find_from_start(doc_id, scan_end(&page)).unwrap();
             assert!(docs.is_some());
         }
     }
@@ -2177,6 +2158,39 @@ mod tests {
             .open(test_dir.join("page_0.zebo"))
             .unwrap();
         ZeboPage::try_new(document_limit, starting_document_id, page_file).unwrap()
+    }
+
+    fn scan_end(page: &ZeboPage) -> u64 {
+        page.scan_end(page.file_len().unwrap()).unwrap()
+    }
+
+    /// Returns the index reads issued since the last call.
+    fn take_index_reads(page: &ZeboPage) -> u64 {
+        page.index_reads
+            .swap(0, std::sync::atomic::Ordering::Relaxed)
+    }
+
+    fn write_slot(page: &mut ZeboPage, slot: u64, (doc_id, offset, len): (u64, u32, u32)) {
+        let mut entry = [0_u8; 16];
+        entry[0..8].copy_from_slice(&doc_id.to_be_bytes());
+        entry[8..12].copy_from_slice(&offset.to_be_bytes());
+        entry[12..16].copy_from_slice(&len.to_be_bytes());
+        page.page_file
+            .write_all_at(DOCUMENT_INDEX_OFFSET + slot * 16, &entry)
+            .unwrap();
+    }
+
+    fn set_next_available_header_offset(page: &mut ZeboPage, slots: u32) {
+        page.page_file
+            .write_all_at(NEXT_AVAILABLE_HEADER_OFFSET, &slots.to_be_bytes())
+            .unwrap();
+        page.next_available_header_offset = slots;
+    }
+
+    fn set_next_available_offset(page: &mut ZeboPage, offset: u32) {
+        page.page_file
+            .write_all_at(NEXT_AVAILABLE_OFFSET, &offset.to_be_bytes())
+            .unwrap();
     }
 
     fn read_header(page: &ZeboPage) -> Vec<u8> {
@@ -2234,8 +2248,12 @@ mod tests {
         payload.extend(entry.repeat(64 * 1024));
         page.page_file.write_all_at(end, &payload).unwrap();
 
-        assert_eq!(page.find_from_start(absent).unwrap(), None);
-        assert_eq!(page.fallback_search_document(absent, None).unwrap(), None);
+        assert_eq!(page.find_from_start(absent, scan_end(&page)).unwrap(), None);
+        assert_eq!(
+            page.fallback_search_document(absent, None, scan_end(&page))
+                .unwrap(),
+            None
+        );
         let found = page
             .get_documents::<u64>(&[(absent, ProbableIndex(0))])
             .unwrap();
@@ -2243,7 +2261,7 @@ mod tests {
 
         // Present documents are still found.
         for id in 1..=3_u64 {
-            assert!(page.find_from_start(id).unwrap().is_some());
+            assert!(page.find_from_start(id, scan_end(&page)).unwrap().is_some());
         }
     }
 
@@ -2255,19 +2273,10 @@ mod tests {
         }
 
         let header_size = ZeboPage::header_size(10) as u32;
-        let corrupt = |page: &mut ZeboPage, slot: u64, doc_id: u64, offset: u32, len: u32| {
-            let mut entry = [0_u8; 16];
-            entry[0..8].copy_from_slice(&doc_id.to_be_bytes());
-            entry[8..12].copy_from_slice(&offset.to_be_bytes());
-            entry[12..16].copy_from_slice(&len.to_be_bytes());
-            page.page_file
-                .write_all_at(DOCUMENT_INDEX_OFFSET + slot * 16, &entry)
-                .unwrap();
-        };
         // Doc 2: payload runs ~4 GiB past the end of the file.
-        corrupt(&mut page, 1, 2, header_size, u32::MAX - 1);
+        write_slot(&mut page, 1, (2, header_size, u32::MAX - 1));
         // Doc 3: payload starts inside the index.
-        corrupt(&mut page, 2, 3, 5, 3);
+        write_slot(&mut page, 2, (3, 5, 3));
 
         let docs = page
             .get_documents::<u64>(&[
@@ -2278,5 +2287,188 @@ mod tests {
             ])
             .unwrap();
         assert_eq!(docs, vec![(1, b"one".to_vec()), (4, b"four".to_vec())]);
+    }
+
+    #[test]
+    fn absent_lookups_on_wrapped_page_are_chunked() {
+        let limit = 100_000_u32;
+        let mut page = new_test_page(limit, 1);
+
+        // Payload bytes over the index plus 4 KiB past it, as a page that wrapped leaves
+        // it. The next-write offset stays at the header size, below the file length.
+        let index_bytes = limit as u64 * 16;
+        let mut state = 0x9E37_79B9_7F4A_7C15_u64;
+        let garbage: Vec<u8> = std::iter::repeat_with(|| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        })
+        .take((index_bytes as usize + 4096) / 8)
+        .flat_map(u64::to_be_bytes)
+        .collect();
+        page.page_file
+            .write_all_at(DOCUMENT_INDEX_OFFSET, &garbage)
+            .unwrap();
+        set_next_available_header_offset(&mut page, limit);
+        // The first 16 slots survived: docs 1..=16. A lookup for a larger id walks back
+        // through the garbage towards them, then falls back to a full scan.
+        for id in 1..=16_u64 {
+            let payload = format!("doc {id}");
+            let offset = page.file_len().unwrap();
+            page.page_file
+                .write_all_at(offset, payload.as_bytes())
+                .unwrap();
+            write_slot(&mut page, id - 1, (id, offset as u32, payload.len() as u32));
+        }
+        let docs = page.get_documents::<u64>(&[(5, ProbableIndex(4))]).unwrap();
+        assert_eq!(docs, vec![(5, b"doc 5".to_vec())]);
+
+        // A full scan is index_bytes / INDEX_SCAN_CHUNK reads; the probes, the walk and
+        // the range search add a handful more.
+        let full_scan_reads = index_bytes.div_ceil(INDEX_SCAN_CHUNK);
+        let started = std::time::Instant::now();
+        take_index_reads(&page);
+        for id in 0..1_000_u64 {
+            let probable_index = ProbableIndex(id * 97 % limit as u64);
+            let found = page
+                .get_documents::<u64>(&[(1_000 + id, probable_index)])
+                .unwrap();
+            assert!(found.is_empty());
+            let reads = take_index_reads(&page);
+            assert!(
+                reads <= full_scan_reads + 8,
+                "lookup {id} issued {reads} index reads"
+            );
+        }
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "1,000 absent lookups took {:?}",
+            started.elapsed()
+        );
+
+        page.get_max_document_id().unwrap();
+        assert!(take_index_reads(&page) <= full_scan_reads);
+    }
+
+    /// A page with docs 1..=10 in slots 0..9 and docs 20, 30, 40 in slots 10..12, past
+    /// its limit of 10, as Zebo 0.5.3 could write them. The first 48 payload bytes are
+    /// padding, so the entries past the limit overwrite no document.
+    fn page_with_slots_past_limit() -> ZeboPage {
+        let mut page = new_test_page(10, 1);
+        let header_size = ZeboPage::header_size(10);
+        page.page_file.set_len(header_size + 48).unwrap();
+        set_next_available_offset(&mut page, header_size as u32 + 48);
+        for id in 1..=10_u64 {
+            page.reserve(&[(id, format!("doc {id}"))])
+                .unwrap()
+                .write_all()
+                .unwrap();
+        }
+
+        for (slot, id) in [(10_u64, 20_u64), (11, 30), (12, 40)] {
+            let payload = format!("doc {id}");
+            let offset = page.file_len().unwrap();
+            page.page_file
+                .write_all_at(offset, payload.as_bytes())
+                .unwrap();
+            write_slot(&mut page, slot, (id, offset as u32, payload.len() as u32));
+        }
+        set_next_available_header_offset(&mut page, 13);
+        let file_len = page.file_len().unwrap() as u32;
+        set_next_available_offset(&mut page, file_len);
+        page
+    }
+
+    #[test]
+    fn entries_past_document_limit_are_found() {
+        let page = page_with_slots_past_limit();
+
+        for (slot, id) in [(10, 20_u64), (11, 30), (12, 40)] {
+            // The accurate slot, then a wrong one that sends the lookup to the fallback.
+            for probe in [slot, 0] {
+                let docs = page
+                    .get_documents::<u64>(&[(id, ProbableIndex(probe))])
+                    .unwrap();
+                assert_eq!(docs, vec![(id, format!("doc {id}").into_bytes())]);
+            }
+            assert!(page.find_from_start(id, scan_end(&page)).unwrap().is_some());
+        }
+        assert_eq!(page.get_max_document_id().unwrap(), Some(40));
+        // Slot == document_limit is readable.
+        let entry = page.get_at(10, scan_end(&page)).unwrap();
+        assert_eq!(entry.map(|(doc_id, _, _)| doc_id), Some(20));
+        // Documents in the regular slots are untouched.
+        let docs = page.get_documents::<u64>(&[(1, ProbableIndex(0))]).unwrap();
+        assert_eq!(docs, vec![(1, b"doc 1".to_vec())]);
+    }
+
+    #[test]
+    fn compact_skips_page_with_slots_past_limit() {
+        let page = page_with_slots_past_limit();
+        let test_dir = prepare_test_dir();
+        let mut target = std::fs::File::options()
+            .create(true)
+            .truncate(true)
+            .read(true)
+            .write(true)
+            .open(test_dir.join("page_0.zebo.compact_tmp"))
+            .unwrap();
+        // The compacted payloads would start where the slots past the limit are stored.
+        let stats = page.compact_to_file(&mut target, &mut vec![]).unwrap();
+        assert!(stats.is_none());
+    }
+
+    #[test]
+    fn inconsistent_page_scans_up_to_document_limit() {
+        let mut page = page_with_slots_past_limit();
+        // A next-write offset below the file length: the page wrapped, so its slot count
+        // is not trusted.
+        set_next_available_offset(&mut page, ZeboPage::header_size(10) as u32 + 100);
+
+        assert_eq!(scan_end(&page), 10);
+        assert_eq!(page.get_max_document_id().unwrap(), Some(10));
+        assert_eq!(page.find_from_start(30, scan_end(&page)).unwrap(), None);
+        let docs = page
+            .get_documents::<u64>(&[(30, ProbableIndex(11))])
+            .unwrap();
+        assert!(docs.is_empty());
+    }
+
+    #[test]
+    fn document_count_never_blocks_reserve() {
+        let mut page = new_test_page(10, 1);
+        for (id, doc) in [(1_u64, "one"), (2, "two")] {
+            page.reserve(&[(id, doc)]).unwrap().write_all().unwrap();
+        }
+
+        // A stored count that drifted below the live entries saturates on delete.
+        page.page_file
+            .write_all_at(DOCUMENT_COUNT_OFFSET, &0_u32.to_be_bytes())
+            .unwrap();
+        let deleted = page
+            .delete_documents(&[(1, ProbableIndex(0)), (2, ProbableIndex(1))], false)
+            .unwrap();
+        assert_eq!(deleted, 2);
+        assert_eq!(page.get_document_count().unwrap(), 0);
+
+        page.reserve(&[(3_u64, "three")])
+            .unwrap()
+            .write_all()
+            .unwrap();
+        let docs = page.get_documents::<u64>(&[(3, ProbableIndex(2))]).unwrap();
+        assert_eq!(docs, vec![(3, b"three".to_vec())]);
+
+        // A count at the top of its range saturates on reserve.
+        page.page_file
+            .write_all_at(DOCUMENT_COUNT_OFFSET, &u32::MAX.to_be_bytes())
+            .unwrap();
+        page.reserve(&[(4_u64, "four")])
+            .unwrap()
+            .write_all()
+            .unwrap();
+        assert_eq!(page.get_document_count().unwrap(), u32::MAX);
+        let docs = page.get_documents::<u64>(&[(4, ProbableIndex(3))]).unwrap();
+        assert_eq!(docs, vec![(4, b"four".to_vec())]);
     }
 }

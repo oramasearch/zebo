@@ -157,7 +157,10 @@ impl<const MAX_DOC_PER_PAGE: u32, const PAGE_SIZE: u64, DocId: DocumentId>
         let current_page_id = self.next_page_id.saturating_sub(1);
         if let Some((_, page)) = self.current_page.as_mut() {
             let used_slots = page.next_available_header_offset;
-            let remain = MAX_DOC_PER_PAGE.saturating_sub(used_slots);
+            // A page created with a smaller limit runs out of slots at its own limit.
+            let remain = MAX_DOC_PER_PAGE
+                .min(page.document_limit())
+                .saturating_sub(used_slots);
             let header_size = ZeboPage::header_size(page.document_limit());
             let next_offset = page.get_next_available_document_offset()? as u64;
             let batch_end = next_offset.saturating_add(batch_bytes);
@@ -168,8 +171,7 @@ impl<const MAX_DOC_PER_PAGE: u32, const PAGE_SIZE: u64, DocId: DocumentId>
             let out_of_slots = remain < document_count;
             let over_page_size = used_slots > 0 && payload_end > PAGE_SIZE;
             let over_offset_limit = batch_end > u32::MAX as u64;
-            let inconsistent =
-                Self::has_inconsistent_offsets(current_page_id, page, next_offset, header_size)?;
+            let inconsistent = Self::has_inconsistent_offsets(current_page_id, page, next_offset)?;
 
             if out_of_slots || over_page_size || over_offset_limit || inconsistent {
                 page.close()?;
@@ -188,24 +190,18 @@ impl<const MAX_DOC_PER_PAGE: u32, const PAGE_SIZE: u64, DocId: DocumentId>
         Ok(reserved_page)
     }
 
-    /// A healthy page's next-write offset equals its file length (or exceeds it while a
-    /// reservation is still being written). An offset below the file length or inside the
-    /// index means the offset wrapped: writing there would overwrite existing payloads,
-    /// so such a page must never be written to again.
-    fn has_inconsistent_offsets(
-        page_id: u64,
-        page: &ZeboPage,
-        next_offset: u64,
-        header_size: u64,
-    ) -> Result<bool> {
+    /// Whether the page's next-write offset wrapped (see
+    /// `ZeboPage::has_inconsistent_offsets`): writing there would overwrite existing
+    /// payloads, so such a page must never be written to again.
+    fn has_inconsistent_offsets(page_id: u64, page: &ZeboPage, next_offset: u64) -> Result<bool> {
         let file_len = page.file_len()?;
-        let inconsistent = next_offset < file_len || next_offset < header_size;
+        let inconsistent = page.has_inconsistent_offsets(next_offset, file_len);
         if inconsistent {
             tracing::warn!(
                 page_id,
                 next_offset,
                 file_len,
-                header_size,
+                header_size = ZeboPage::header_size(page.document_limit()),
                 "Page next-write offset is inconsistent with its file length; rotating to a new page"
             );
         }
@@ -1987,6 +1983,107 @@ mod tests {
 
         fn len(&self) -> usize {
             self.id.len() + 1 + self.text.len()
+        }
+    }
+
+    #[test]
+    fn rotates_when_page_limit_is_below_const() {
+        let test_dir = prepare_test_dir();
+
+        let mut zebo = Zebo::<4, { 1024 * 1024 }, u64>::try_new(&test_dir).unwrap();
+        for id in 1..=4_u64 {
+            zebo.reserve_space_for(&[(id, format!("doc {id}"))])
+                .unwrap()
+                .write_all()
+                .unwrap();
+        }
+        drop(zebo);
+
+        // Reopened with a larger limit: the full 4-slot page must rotate, not fail.
+        let mut zebo = Zebo::<10, { 1024 * 1024 }, u64>::try_new(&test_dir).unwrap();
+        zebo.reserve_space_for(&[(5_u64, "doc 5")])
+            .unwrap()
+            .write_all()
+            .unwrap();
+
+        assert_eq!(page_file_count(&test_dir), 2);
+        for id in 1..=5_u64 {
+            assert_eq!(
+                zebo.get_document(id).unwrap().unwrap(),
+                format!("doc {id}").into_bytes()
+            );
+        }
+    }
+
+    #[test]
+    fn crash_between_reserve_and_write_recovers() {
+        let test_dir = prepare_test_dir();
+
+        let mut zebo = Zebo::<10, { 1024 * 1024 }, u64>::try_new(&test_dir).unwrap();
+        for id in 1..=3_u64 {
+            zebo.reserve_space_for(&[(id, format!("doc {id}"))])
+                .unwrap()
+                .write_all()
+                .unwrap();
+        }
+        // Reserved but never written: slot 3 stays uninitialized and the next-write
+        // offset is ahead of the file length.
+        let reserved = zebo.reserve_space_for(&[(4_u64, "doc 4")]).unwrap();
+        drop(reserved);
+        drop(zebo);
+
+        let mut zebo = Zebo::<10, { 1024 * 1024 }, u64>::try_new(&test_dir).unwrap();
+        zebo.reserve_space_for(&[(5_u64, "doc 5")])
+            .unwrap()
+            .write_all()
+            .unwrap();
+
+        for id in [1, 2, 3, 5_u64] {
+            assert_eq!(
+                zebo.get_document(id).unwrap().unwrap(),
+                format!("doc {id}").into_bytes()
+            );
+        }
+        assert_eq!(zebo.get_document(4).unwrap(), None);
+        zebo.get_last_inserted_document_id().unwrap();
+    }
+
+    #[test]
+    fn no_rotation_churn_after_wrapped_page() {
+        let test_dir = prepare_test_dir();
+        let page_path = test_dir.join("page_0.zebo");
+
+        let mut zebo = Zebo::<100, { 1024 * 1024 }, u64>::try_new(&test_dir).unwrap();
+        for id in 1..=2_u64 {
+            zebo.reserve_space_for(&[(id, format!("doc {id}"))])
+                .unwrap()
+                .write_all()
+                .unwrap();
+        }
+        drop(zebo);
+
+        // A wrapped offset: below the file length, pointing into existing payloads.
+        seed_next_available_offset(&page_path, ZeboPage::header_size(100) as u32 + 2);
+
+        let mut zebo = Zebo::<100, { 1024 * 1024 }, u64>::try_new(&test_dir).unwrap();
+        for id in 3..=22_u64 {
+            if id == 12 {
+                // Reload, as a restarted process would: the new page is the current one.
+                drop(zebo);
+                zebo = Zebo::<100, { 1024 * 1024 }, u64>::try_new(&test_dir).unwrap();
+            }
+            zebo.reserve_space_for(&[(id, format!("doc {id}"))])
+                .unwrap()
+                .write_all()
+                .unwrap();
+            assert_eq!(page_file_count(&test_dir), 2, "after inserting doc {id}");
+        }
+
+        for id in 1..=22_u64 {
+            assert_eq!(
+                zebo.get_document(id).unwrap().unwrap(),
+                format!("doc {id}").into_bytes()
+            );
         }
     }
 }
