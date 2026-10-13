@@ -53,8 +53,15 @@ pub struct Zebo<const MAX_DOC_PER_PAGE: u32, const PAGE_SIZE: u64, DocId> {
     base_dir: PathBuf,
     next_page_id: u64,
     index: ZeboIndex<DocId>,
-    current_page: Option<(DocId, ZeboPage)>,
+    current_page: Option<CurrentPage>,
     remove_documents_cache: HashMap<PageId, Vec<(u64, ProbableIndex)>>,
+}
+
+/// The page new batches are reserved on.
+struct CurrentPage {
+    page: ZeboPage,
+    /// Highest document id reserved on the page, or `None` while it is empty.
+    max_document_id: Option<u64>,
 }
 
 impl<const MAX_DOC_PER_PAGE: u32, const PAGE_SIZE: u64, DocId: DocumentId>
@@ -97,9 +104,16 @@ impl<const MAX_DOC_PER_PAGE: u32, const PAGE_SIZE: u64, DocId: DocumentId>
                 match index.get_page_ids()?.into_iter().max() {
                     Some(page_id) => {
                         let page = load_page(&base_dir, page_id, Mode::Change)?;
-                        let starting_document_id = DocId::from_u64(page.starting_document_id);
+                        let max_document_id = page.get_max_document_id()?;
 
-                        (index, Some(page_id), Some((starting_document_id, page)))
+                        (
+                            index,
+                            Some(page_id),
+                            Some(CurrentPage {
+                                page,
+                                max_document_id,
+                            }),
+                        )
                     }
                     None => (index, None, None),
                 }
@@ -130,6 +144,20 @@ impl<const MAX_DOC_PER_PAGE: u32, const PAGE_SIZE: u64, DocId: DocumentId>
     /// bytes (the fixed-size index is not counted), would push its `u32` payload offset
     /// past `u32::MAX`, or has inconsistent offsets. A fresh page accepts its first batch
     /// even when the batch alone exceeds `PAGE_SIZE`.
+    ///
+    /// Lookups route an id to the last page whose starting id is `<=` it, so ids must
+    /// arrive in ascending order:
+    /// - `docs` must be strictly ascending by id (no duplicates). Otherwise the batch is
+    ///   refused with `UnsortedBatch { position }` and nothing is written; sorting and
+    ///   deduplicating is left to the caller.
+    /// - A batch whose first id is below the current page's starting id, or not above
+    ///   the highest id already reserved on it, is still accepted, so that replaying
+    ///   earlier inserts keeps working, and a warning is logged. Without a rotation it
+    ///   goes into the current page; ids below the page's starting id are then routed to
+    ///   an earlier page, which returns its older copy, or nothing below the first page.
+    ///   If the page must rotate, the new page starts just above the highest id on the
+    ///   closing page instead of at the batch's first id, keeping page starts strictly
+    ///   ascending; batch ids below that start are routed to earlier pages the same way.
     pub fn reserve_space_for<'docs, Doc: Document>(
         &mut self,
         docs: &'docs [(DocId, Doc)],
@@ -144,6 +172,13 @@ impl<const MAX_DOC_PER_PAGE: u32, const PAGE_SIZE: u64, DocId: DocumentId>
         if docs.is_empty() {
             return Err(ZeboError::NoDocToAdd);
         }
+        if let Some(position) = docs.windows(2).position(|w| w[0].0 >= w[1].0) {
+            return Err(ZeboError::UnsortedBatch {
+                position: position + 1,
+            });
+        }
+        let first_id = docs[0].0.as_u64();
+        let last_id = docs[docs.len() - 1].0.as_u64();
 
         let batch_bytes: u64 = docs.iter().map(|(_, doc)| doc.len() as u64).sum();
         // Payload offsets are u32: a batch that does not fit even in a fresh page is refused.
@@ -155,7 +190,12 @@ impl<const MAX_DOC_PER_PAGE: u32, const PAGE_SIZE: u64, DocId: DocumentId>
         }
 
         let current_page_id = self.next_page_id.saturating_sub(1);
-        if let Some((_, page)) = self.current_page.as_mut() {
+        let mut next_page_start = first_id;
+        if let Some(CurrentPage {
+            page,
+            max_document_id,
+        }) = self.current_page.as_mut()
+        {
             let used_slots = page.next_available_header_offset;
             // A page created with a smaller limit runs out of slots at its own limit.
             let remain = MAX_DOC_PER_PAGE
@@ -173,19 +213,45 @@ impl<const MAX_DOC_PER_PAGE: u32, const PAGE_SIZE: u64, DocId: DocumentId>
             let over_offset_limit = batch_end > u32::MAX as u64;
             let inconsistent = Self::has_inconsistent_offsets(current_page_id, page, next_offset)?;
 
+            let page_start = page.starting_document_id;
             if out_of_slots || over_page_size || over_offset_limit || inconsistent {
+                // The new page must start above every id routed to this page or earlier
+                // ones, or `ZeboIndex::get_pages` could no longer binary-search the starts.
+                let floor = max_document_id.map_or(page_start, |max| max.max(page_start));
+                if first_id <= floor {
+                    next_page_start = floor.saturating_add(1);
+                    tracing::warn!(
+                        first_id,
+                        new_page_start = next_page_start,
+                        ids_below_new_page_start =
+                            docs.partition_point(|(id, _)| id.as_u64() < next_page_start),
+                        "Batch starts at or below ids already stored; the new page starts above them"
+                    );
+                }
                 page.close()?;
                 self.current_page = None;
+            } else if first_id < page_start || max_document_id.is_some_and(|max| first_id <= max) {
+                tracing::warn!(
+                    first_id,
+                    last_id,
+                    page_start,
+                    page_max_id = ?max_document_id,
+                    "Batch starts below the current page or at or below an id already on it"
+                );
             }
         }
 
         if self.current_page.is_none() {
-            self.build_next_page(docs[0].0)?;
+            self.build_next_page(DocId::from_u64(next_page_start))?;
         }
 
-        let (_, current_page) = self.current_page.as_mut().expect("Set above");
-
-        let reserved_page = current_page.reserve(docs)?;
+        let current_page = self.current_page.as_mut().expect("Set above");
+        let reserved_page = current_page.page.reserve(docs)?;
+        current_page.max_document_id = Some(
+            current_page
+                .max_document_id
+                .map_or(last_id, |max| max.max(last_id)),
+        );
 
         Ok(reserved_page)
     }
@@ -389,7 +455,9 @@ impl<const MAX_DOC_PER_PAGE: u32, const PAGE_SIZE: u64, DocId: DocumentId>
             // Extract all document IDs and their probable indices from this page
             let mut page_documents = Vec::with_capacity(header.index.len());
             for (doc_id, _, _) in header.index {
-                let probable_index = ProbableIndex(doc_id - page.starting_document_id);
+                // Ids below the page start (replayed batches) estimate slot 0 instead of underflowing.
+                let probable_index =
+                    ProbableIndex(doc_id.saturating_sub(page.starting_document_id));
                 page_documents.push((doc_id, probable_index));
             }
 
@@ -443,7 +511,7 @@ impl<const MAX_DOC_PER_PAGE: u32, const PAGE_SIZE: u64, DocId: DocumentId>
     }
 
     fn build_next_page(&mut self, doc_id: DocId) -> Result<()> {
-        if let Some((_, mut page)) = self.current_page.take() {
+        if let Some(CurrentPage { mut page, .. }) = self.current_page.take() {
             // Close previous page
             page.close()?;
         }
@@ -470,7 +538,10 @@ impl<const MAX_DOC_PER_PAGE: u32, const PAGE_SIZE: u64, DocId: DocumentId>
         };
 
         let page = ZeboPage::try_new(MAX_DOC_PER_PAGE, doc_id.as_u64(), page_file)?;
-        self.current_page = Some((doc_id, page));
+        self.current_page = Some(CurrentPage {
+            page,
+            max_document_id: None,
+        });
         self.next_page_id += 1;
 
         Ok(())
@@ -2084,6 +2155,218 @@ mod tests {
                 zebo.get_document(id).unwrap().unwrap(),
                 format!("doc {id}").into_bytes()
             );
+        }
+    }
+
+    /// Every file under `dir`, with its contents, sorted by path.
+    fn dir_snapshot(dir: &Path) -> Vec<(PathBuf, Vec<u8>)> {
+        let mut files = Vec::new();
+        let mut dirs = vec![dir.to_path_buf()];
+        while let Some(dir) = dirs.pop() {
+            for entry in std::fs::read_dir(dir).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    dirs.push(path);
+                } else {
+                    let bytes = std::fs::read(&path).unwrap();
+                    files.push((path, bytes));
+                }
+            }
+        }
+        files.sort();
+        files
+    }
+
+    /// Counts the warnings `f` logs on the current thread.
+    fn count_warnings(f: impl FnOnce()) -> usize {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+        use tracing_subscriber::layer::SubscriberExt;
+
+        struct WarnCounter(Arc<AtomicUsize>);
+        impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for WarnCounter {
+            fn on_event(
+                &self,
+                event: &tracing::Event<'_>,
+                _: tracing_subscriber::layer::Context<'_, S>,
+            ) {
+                if *event.metadata().level() == tracing::Level::WARN {
+                    self.0.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+        }
+
+        let count = Arc::new(AtomicUsize::new(0));
+        let subscriber = tracing_subscriber::registry().with(WarnCounter(count.clone()));
+        tracing::subscriber::with_default(subscriber, f);
+        count.load(Ordering::Relaxed)
+    }
+
+    fn insert<const N: u32, const S: u64>(zebo: &mut Zebo<N, S, u64>, docs: &[(u64, String)]) {
+        zebo.reserve_space_for(docs).unwrap().write_all().unwrap();
+    }
+
+    fn docs(ids: impl IntoIterator<Item = u64>, version: &str) -> Vec<(u64, String)> {
+        ids.into_iter()
+            .map(|id| (id, format!("{version} {id}")))
+            .collect()
+    }
+
+    fn assert_page_starts_ascending<const N: u32, const S: u64>(zebo: &Zebo<N, S, u64>) {
+        let pages = zebo.get_all_pages().unwrap();
+        assert!(
+            pages.windows(2).all(|w| w[0].0 < w[1].0),
+            "page starts not strictly ascending: {pages:?}"
+        );
+    }
+
+    #[test]
+    fn unsorted_batch_is_refused() {
+        let test_dir = prepare_test_dir();
+        let mut zebo = Zebo::<100, { 1024 * 1024 }, u64>::try_new(&test_dir).unwrap();
+
+        // On an empty store no page is created.
+        let err = zebo
+            .reserve_space_for(&[(7, "a"), (5, "b"), (6, "c")])
+            .unwrap_err();
+        assert!(matches!(err, ZeboError::UnsortedBatch { position: 1 }));
+        assert_eq!(page_file_count(&test_dir), 0);
+
+        insert(&mut zebo, &docs(1..=3, "v1"));
+        let before = dir_snapshot(&test_dir);
+        let err = zebo
+            .reserve_space_for(&[(7, "a"), (5, "b"), (6, "c")])
+            .unwrap_err();
+        assert!(matches!(err, ZeboError::UnsortedBatch { position: 1 }));
+        assert_eq!(dir_snapshot(&test_dir), before);
+    }
+
+    #[test]
+    fn duplicate_ids_in_batch_are_refused() {
+        let test_dir = prepare_test_dir();
+        let mut zebo = Zebo::<100, { 1024 * 1024 }, u64>::try_new(&test_dir).unwrap();
+        insert(&mut zebo, &docs(1..=3, "v1"));
+        let before = dir_snapshot(&test_dir);
+
+        let err = zebo
+            .reserve_space_for(&[(4, "a"), (5, "b"), (5, "c")])
+            .unwrap_err();
+        assert!(matches!(err, ZeboError::UnsortedBatch { position: 2 }));
+        assert_eq!(dir_snapshot(&test_dir), before);
+    }
+
+    #[test]
+    fn batch_below_current_page_is_inserted_with_warning() {
+        let test_dir = prepare_test_dir();
+        let mut zebo = Zebo::<10, { 1024 * 1024 }, u64>::try_new(&test_dir).unwrap();
+        insert(&mut zebo, &docs(1..=9, "v1"));
+        // Out of slots: the second page starts at 10.
+        insert(&mut zebo, &docs(10..=12, "v1"));
+        assert_eq!(page_file_count(&test_dir), 2);
+
+        // 9 is below the current page start: inserted there, with one warning.
+        let warnings = count_warnings(|| insert(&mut zebo, &docs([9, 13], "v2")));
+        assert_eq!(warnings, 1);
+        assert_eq!(page_file_count(&test_dir), 2);
+        assert_page_starts_ascending(&zebo);
+
+        // 9 routes to the first page and returns its earlier copy.
+        assert_eq!(zebo.get_document(9).unwrap().unwrap(), b"v1 9");
+        assert_eq!(zebo.get_document(13).unwrap().unwrap(), b"v2 13");
+        for id in (1..=8).chain(10..=12) {
+            assert_eq!(
+                zebo.get_document(id).unwrap().unwrap(),
+                format!("v1 {id}").into_bytes()
+            );
+        }
+        // The copy of 9 on the second page is shadowed by the one it routes to.
+        let all_ids: std::collections::BTreeSet<u64> = zebo
+            .get_all_documents()
+            .unwrap()
+            .map(|r| r.unwrap().0)
+            .collect();
+        assert_eq!(all_ids, (1..=13).collect());
+    }
+
+    #[test]
+    fn batch_below_closing_page_starts_new_page_above_it() {
+        let test_dir = prepare_test_dir();
+        let mut zebo = Zebo::<4, { 1024 * 1024 }, u64>::try_new(&test_dir).unwrap();
+        insert(&mut zebo, &docs(1..=4, "v1"));
+        insert(&mut zebo, &docs(5..=7, "v1"));
+
+        // The second page has one slot left, so this batch rotates. Its first id is
+        // below the closing page's highest id (7), so the new page starts at 8.
+        let warnings = count_warnings(|| insert(&mut zebo, &docs([3, 6, 8, 9], "v2")));
+        assert_eq!(warnings, 1);
+        drop(zebo);
+
+        let mut zebo = Zebo::<4, { 1024 * 1024 }, u64>::try_new(&test_dir).unwrap();
+        assert_page_starts_ascending(&zebo);
+        let starts: Vec<u64> = zebo
+            .get_all_pages()
+            .unwrap()
+            .into_iter()
+            .map(|(start, _)| start)
+            .collect();
+        assert_eq!(starts, [1, 5, 8]);
+
+        // Ids above the new start read from the new page; the others return the copy
+        // on the page they route to.
+        for id in 1..=7 {
+            assert_eq!(
+                zebo.get_document(id).unwrap().unwrap(),
+                format!("v1 {id}").into_bytes()
+            );
+        }
+        for id in 8..=9 {
+            assert_eq!(
+                zebo.get_document(id).unwrap().unwrap(),
+                format!("v2 {id}").into_bytes()
+            );
+        }
+
+        // Later batches still route correctly, with no warning.
+        let warnings = count_warnings(|| {
+            insert(&mut zebo, &docs(10..=10, "v3"));
+            insert(&mut zebo, &docs(11..=13, "v3"));
+        });
+        assert_eq!(warnings, 0);
+        assert_page_starts_ascending(&zebo);
+        for id in 10..=13 {
+            assert_eq!(
+                zebo.get_document(id).unwrap().unwrap(),
+                format!("v3 {id}").into_bytes()
+            );
+        }
+    }
+
+    #[test]
+    fn sorted_batches_route_across_pages() {
+        let test_dir = prepare_test_dir();
+        let mut zebo = Zebo::<1000, 4096, u64>::try_new(&test_dir).unwrap();
+        let doc = |id: u64| format!("{id:>1024}");
+
+        let warnings = count_warnings(|| {
+            for batch in (1..=30_u64).collect::<Vec<_>>().chunks(3) {
+                let batch: Vec<_> = batch.iter().map(|id| (*id, doc(*id))).collect();
+                insert(&mut zebo, &batch);
+            }
+        });
+        assert_eq!(warnings, 0);
+        assert!(page_file_count(&test_dir) > 5);
+        assert_page_starts_ascending(&zebo);
+
+        let found: Vec<_> = zebo
+            .get_documents(1..=30_u64)
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        assert_eq!(found.len(), 30);
+        for (id, bytes) in found {
+            assert_eq!(bytes, doc(id).into_bytes());
         }
     }
 }
