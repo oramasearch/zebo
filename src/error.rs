@@ -36,6 +36,15 @@ pub enum ZeboError {
         got: u32,
     },
     NoDocToAdd,
+    /// The batch ids are not strictly ascending: `docs[position]` is not greater than
+    /// `docs[position - 1]`.
+    UnsortedBatch {
+        position: usize,
+    },
+    /// No greater page start can be represented by the document ID type.
+    PageStartOverflow {
+        last_id: u64,
+    },
 }
 impl Display for ZeboError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -45,6 +54,15 @@ impl Display for ZeboError {
             }
             ZeboError::NoDocToAdd => {
                 write!(f, "No document to add")
+            }
+            ZeboError::UnsortedBatch { position } => {
+                write!(
+                    f,
+                    "Batch ids are not strictly ascending at position {position}"
+                )
+            }
+            ZeboError::PageStartOverflow { last_id } => {
+                write!(f, "Cannot start a page above document id {last_id}")
             }
             ZeboError::TooManyDocuments { max, got } => {
                 write!(f, "Too many documents: got {got}, max is {max}")
