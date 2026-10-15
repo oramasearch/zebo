@@ -52,6 +52,20 @@ fn main() {
 
 ## Design choice
 
+`reserve_space_for` requires strictly ascending document IDs within each batch.
+Unsorted or duplicate IDs return `ZeboError::UnsortedBatch { position }` before
+any file is changed; `position` is the first zero-based index whose ID is not
+greater than the preceding ID. Callers must sort and deduplicate before reserving.
+
+Across batches, IDs should also increase. For replay compatibility, a batch
+starting at or below an earlier reserved ID is accepted with a warning. When
+that batch rotates the page, the new page starts above the closing page's
+maximum ID, keeping page starts ascending. Replayed IDs below the new start
+still route to an earlier page and return its older copy, or nothing if no copy
+exists there. This API does not provide last-write-wins updates across batches.
+If no greater page start fits the document ID type, rotation returns
+`ZeboError::PageStartOverflow { last_id }` before any file is changed.
+
 You may wonder why there's no "insert_document" method.
 Instead, we have "reserve_space_for" method that reserves space for multiple documents at once.
 This is because reserving space for multiple documents at once allows Zebo to optimize file usage and minimize fragmentation.
