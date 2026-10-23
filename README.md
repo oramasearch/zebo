@@ -89,3 +89,19 @@ space.write_all().unwrap(); // Write the content outside the lock
 
 So you can write documents without holding the lock.
 This because `space` points to a specific location in a specific file, and writing to that location does not require access to the `Zebo` instance itself.
+
+## Wrapped pages and deletions
+
+Pages whose next-write offset lies inside their index or below their file length
+are read-only. Inserts rotate to a fresh page; deletion records go to
+`page_N.deleted`, an append-only sequence of big-endian `u64` document IDs.
+Every lookup, iteration, count and inspection consults that sidecar. Deletes sync
+the sidecar before returning, and the next append discards an incomplete trailing
+record left by an interrupted write. `clean_data` cannot erase payloads on these
+pages. Keep the sidecar with the page when copying or backing up storage.
+
+Compaction skips wrapped pages. Once no readable documents remain, wrapped pages
+and their sidecars are removed. Before removal, an atomically replaced and synced
+`watermark` file preserves the maximum document ID and next page number, so a
+restart cannot reuse IDs or reopen an earlier page for inserts. Older stores
+without a watermark remain readable. Include `watermark` in backups.

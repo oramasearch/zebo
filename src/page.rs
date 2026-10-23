@@ -1,4 +1,10 @@
-use std::{fs::File, io::Write, ops::ControlFlow};
+use std::{
+    collections::HashSet,
+    fs::File,
+    io::Write,
+    ops::ControlFlow,
+    path::{Path, PathBuf},
+};
 
 use positioned_io::{ReadAt, WriteAt};
 
@@ -51,6 +57,9 @@ const FALLBACK_WALK_LIMIT: u64 = 1024;
 /// | `8 bytes` | starting document id
 /// | `(8 bytes, 4 bytes, 4 bytes) * MAX_DOC_PER_PAGE` | doc_id.as_u64(), starting offset, bytes length
 /// | `variable length`  | documents
+///
+/// A page whose `u32` write offset wrapped is read-only (see [`ZeboPage::has_wrapped_offsets`]):
+/// its file is never written again and its deletions go to a [`DeletedSidecar`].
 pub struct ZeboPage {
     document_limit: u32,
     #[allow(dead_code)]
@@ -60,6 +69,8 @@ pub struct ZeboPage {
     /// Index read syscalls issued by this page, so tests can bound scan costs.
     #[cfg(test)]
     index_reads: std::sync::atomic::AtomicU64,
+    /// `Some` exactly when the page is read-only.
+    sidecar: Option<DeletedSidecar>,
 }
 
 impl ZeboPage {
@@ -126,12 +137,15 @@ impl ZeboPage {
             next_available_header_offset: 0,
             #[cfg(test)]
             index_reads: Default::default(),
+            sidecar: None,
         };
 
         Ok(s)
     }
 
-    pub fn try_load(page_file: std::fs::File) -> Result<Self> {
+    /// Loads a page from its file. When the page is wrapped it is read-only, and the
+    /// deletions recorded in `sidecar_path` are loaded too; healthy pages ignore that path.
+    pub fn try_load(page_file: std::fs::File, sidecar_path: PathBuf) -> Result<Self> {
         let mut buf = [0; 1];
         page_file
             .read_exact_at(VERSION_OFFSET, &mut buf)
@@ -162,18 +176,63 @@ impl ZeboPage {
             .map_err(ZeboError::OperationError)?;
         let starting_document_id = u64::from_be_bytes(buf);
 
-        Ok(Self {
+        let mut page = Self {
             page_file,
             document_limit,
             starting_document_id,
             next_available_header_offset,
             #[cfg(test)]
             index_reads: Default::default(),
-        })
+            sidecar: None,
+        };
+        if page.has_wrapped_offsets()? {
+            page.sidecar = Some(DeletedSidecar::load(sidecar_path)?);
+        }
+
+        Ok(page)
     }
 
     pub fn document_limit(&self) -> u32 {
         self.document_limit
+    }
+
+    /// A healthy page's next-write offset equals its file length (or exceeds it while a
+    /// reservation is still being written). An offset below the file length or inside the
+    /// index means the `u32` offset wrapped and later payloads overwrote older bytes,
+    /// possibly index slots. Such a page is read-only.
+    pub(crate) fn has_wrapped_offsets(&self) -> Result<bool> {
+        let next_offset = self.get_next_available_document_offset()? as u64;
+        Ok(next_offset < self.file_len()? || next_offset < Self::header_size(self.document_limit))
+    }
+
+    /// Whether this page was wrapped when loaded: nothing may write to its file.
+    pub(crate) fn is_read_only(&self) -> bool {
+        self.sidecar.is_some()
+    }
+
+    fn is_deleted_in_sidecar(&self, doc_id: u64) -> bool {
+        self.sidecar
+            .as_ref()
+            .is_some_and(|sidecar| sidecar.ids.contains(&doc_id))
+    }
+
+    /// Index entries of a read-only page that are still served: initialized, without a
+    /// deletion marker, pointing inside the file, and not listed in the sidecar.
+    fn live_entries(&self) -> Result<Vec<(u64, u32, u32)>> {
+        let file_len = self.file_len()?;
+        let mut entries = Vec::new();
+        let scan_end = self.scan_end(file_len)?;
+        self.scan_index(0, scan_end, |_, (doc_id, offset, len)| {
+            if !Self::is_uninitialized_entry(offset)
+                && !Self::is_deleted(doc_id, offset, len)
+                && self.is_payload_in_bounds(offset, len, file_len)
+                && !self.is_deleted_in_sidecar(doc_id)
+            {
+                entries.push((doc_id, offset, len));
+            }
+            ControlFlow::<()>::Continue(())
+        })?;
+        Ok(entries)
     }
 
     pub fn live_data_size(&self) -> Result<u64> {
@@ -188,7 +247,13 @@ impl ZeboPage {
         Ok(total)
     }
 
+    /// Number of live documents. For a read-only page the stored count is not trusted:
+    /// it is recomputed from the index entries that are still served.
     pub fn get_document_count(&self) -> Result<u32> {
+        if self.is_read_only() {
+            return Ok(u32::try_from(self.live_entries()?.len()).unwrap_or(u32::MAX));
+        }
+
         let mut buf = [0; 4];
         self.page_file
             .read_exact_at(DOCUMENT_COUNT_OFFSET, &mut buf)
@@ -336,8 +401,20 @@ impl ZeboPage {
     }
 
     pub fn get_header(&self) -> Result<ZeboPageHeader> {
-        let document_count = self.get_document_count()?;
         let next_available_document_offset = self.get_next_available_document_offset()?;
+        if self.is_read_only() {
+            let index = self.live_entries()?;
+            return Ok(ZeboPageHeader {
+                document_limit: self.document_limit,
+                document_count: u32::try_from(index.len()).unwrap_or(u32::MAX),
+                next_available_document_offset,
+                next_available_header_offset: self.next_available_header_offset,
+                index,
+                starting_document_id: self.starting_document_id,
+            });
+        }
+
+        let document_count = self.get_document_count()?;
         let scan_end = self.scan_end(self.file_len()?)?;
 
         // The stored count is informational and may be garbage: never size by it alone.
@@ -388,6 +465,10 @@ impl ZeboPage {
         }
 
         for (doc_id, probable_index) in doc_id_with_index {
+            if self.is_deleted_in_sidecar(*doc_id) {
+                continue;
+            }
+
             // Try to get data at probable index if it's within bounds
             let probable_index = ProbableIndex(probable_index.0.min(scan_end - 1));
 
@@ -483,6 +564,15 @@ impl ZeboPage {
         &mut self,
         documents: &'docs [(DocId, Doc)],
     ) -> Result<ZeboPageReservedSpace<'docs, DocId, Doc>> {
+        let documents_size: u64 = documents.iter().map(|(_, doc)| doc.len() as u64).sum();
+        let not_enough_space = || ZeboError::NotEnoughSpace {
+            limit: u32::MAX,
+            new_allocation_requested: u32::try_from(documents_size).unwrap_or(u32::MAX),
+        };
+        if self.is_read_only() {
+            return Err(not_enough_space());
+        }
+
         let mut buf = [0; 4];
         self.page_file
             .read_exact_at(NEXT_AVAILABLE_OFFSET, &mut buf)
@@ -499,11 +589,6 @@ impl ZeboPage {
             .map_err(ZeboError::OperationError)?;
         let current_document_count = u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]);
 
-        let documents_size: u64 = documents.iter().map(|(_, doc)| doc.len() as u64).sum();
-        let not_enough_space = || ZeboError::NotEnoughSpace {
-            limit: u32::MAX,
-            new_allocation_requested: u32::try_from(documents_size).unwrap_or(u32::MAX),
-        };
         let too_many_documents = || ZeboError::TooManyDocuments {
             max: self
                 .document_limit
@@ -558,11 +643,33 @@ impl ZeboPage {
         })
     }
 
+    /// Deletes the given documents and returns how many were live. A healthy page marks
+    /// their index slots (and zeroes their payloads with `clean_data`). A read-only page
+    /// is never written: the ids go to its sidecar and `clean_data` is ignored.
     pub fn delete_documents(
         &mut self,
         documents_to_delete: &[(u64, ProbableIndex)],
         clean_data: bool,
     ) -> Result<u32> {
+        if self.is_read_only() {
+            let live: HashSet<u64> = self
+                .live_entries()?
+                .into_iter()
+                .map(|(doc_id, _, _)| doc_id)
+                .collect();
+            let mut deleted: Vec<u64> = documents_to_delete
+                .iter()
+                .map(|(doc_id, _)| *doc_id)
+                .filter(|doc_id| live.contains(doc_id))
+                .collect();
+            deleted.sort_unstable();
+            deleted.dedup();
+
+            let sidecar = self.sidecar.as_mut().expect("read-only page has a sidecar");
+            sidecar.append(&deleted)?;
+            return Ok(u32::try_from(deleted.len()).unwrap_or(u32::MAX));
+        }
+
         // Should we sort documents_to_delete?
         // I have no idea if accessing to the page in a random way is slower than
         // ordered way. Probably yes.
@@ -886,13 +993,17 @@ impl ZeboPage {
     /// Writes a compacted copy of this page into `target_file`.
     ///
     /// Returns `Ok(None)`, leaving `target_file` to be discarded, when the page cannot
-    /// be compacted safely: an entry points outside the file, or the live data does not
-    /// fit in `u32` offsets.
+    /// be compacted safely: the page is read-only, an entry points outside the file, or
+    /// the live data does not fit in `u32` offsets.
     pub fn compact_to_file(
         &self,
         target_file: &mut File,
         buf: &mut Vec<u8>,
     ) -> Result<Option<CompactPageStats>> {
+        if self.is_read_only() {
+            return Ok(None);
+        }
+
         let bytes_before = self.file_len()?;
 
         let header_size = Self::header_size(self.document_limit);
@@ -1149,7 +1260,10 @@ impl ZeboPage {
                 return ControlFlow::Break(None); // reach the end
             }
 
-            if bytes_length == u32::MAX || starting_offset == u32::MAX {
+            if bytes_length == u32::MAX
+                || starting_offset == u32::MAX
+                || self.is_deleted_in_sidecar(doc_id)
+            {
                 if !skip_document_content {
                     writeln!(writer, "Document is deleted or uninitialized").unwrap();
                 }
@@ -1205,6 +1319,74 @@ impl ZeboPage {
 
         Ok(())
     }
+}
+
+/// Deletions of a read-only page, stored next to it as `page_<N>.deleted`.
+///
+/// The file is an append-only sequence of `u64` doc ids (big-endian), fsync'd on every
+/// delete call. A listed id is treated exactly like an index entry with a deletion marker.
+/// A torn trailing record (file length not a multiple of 8) is ignored on load and cut
+/// off before the next append. A missing file means no deletions.
+struct DeletedSidecar {
+    path: PathBuf,
+    ids: HashSet<u64>,
+}
+
+impl DeletedSidecar {
+    fn load(path: PathBuf) -> Result<Self> {
+        let bytes = match std::fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+            Err(e) => return Err(ZeboError::OperationError(e)),
+        };
+        let torn = bytes.len() % 8;
+        if torn != 0 {
+            warn!(path = ?path, torn, "Ignoring a torn trailing record in a deletion sidecar");
+        }
+        let ids = bytes
+            .as_chunks::<8>()
+            .0
+            .iter()
+            .map(|record| u64::from_be_bytes(*record))
+            .collect();
+
+        Ok(Self { path, ids })
+    }
+
+    /// Appends `ids` and fsyncs the file (and its directory when the file is new).
+    fn append(&mut self, ids: &[u64]) -> Result<()> {
+        if ids.is_empty() {
+            return Ok(());
+        }
+
+        let mut file = std::fs::File::options()
+            .create(true)
+            .append(true)
+            .open(&self.path)
+            .map_err(ZeboError::OperationError)?;
+        let len = file.metadata().map_err(ZeboError::OperationError)?.len();
+        if len % 8 != 0 {
+            file.set_len(len - len % 8)
+                .map_err(ZeboError::OperationError)?;
+        }
+        let records: Vec<u8> = ids.iter().flat_map(|id| id.to_be_bytes()).collect();
+        file.write_all(&records)
+            .map_err(ZeboError::OperationError)?;
+        file.sync_all().map_err(ZeboError::OperationError)?;
+        if len == 0
+            && let Some(dir) = self.path.parent()
+        {
+            crate::sync_dir(dir)?;
+        }
+
+        self.ids.extend(ids);
+        Ok(())
+    }
+}
+
+/// Path of the deletion sidecar of the page stored at `page_path`.
+pub(crate) fn sidecar_path(page_path: &Path) -> PathBuf {
+    page_path.with_extension("deleted")
 }
 
 /// Index entries a lookup skipped because their payload lies outside the page file.

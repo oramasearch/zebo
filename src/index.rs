@@ -7,8 +7,6 @@ use crate::{DocumentId, PageId, Result, Version, ZeboError};
 pub struct ZeboIndex<DocId> {
     offset: u64,
     index_file: std::fs::File,
-    #[cfg(test)]
-    #[allow(dead_code)]
     index_file_path: PathBuf,
     p: std::marker::PhantomData<DocId>,
 }
@@ -40,7 +38,6 @@ impl<DocId: DocumentId> ZeboIndex<DocId> {
             offset: 8 + 1,
             index_file,
             p: std::marker::PhantomData,
-            #[cfg(test)]
             index_file_path,
         })
     }
@@ -77,7 +74,6 @@ impl<DocId: DocumentId> ZeboIndex<DocId> {
             offset,
             index_file,
             p: std::marker::PhantomData,
-            #[cfg(test)]
             index_file_path,
         })
     }
@@ -107,6 +103,48 @@ impl<DocId: DocumentId> ZeboIndex<DocId> {
         Ok(())
     }
 
+    /// Drops `page_id` from the index; the other pages keep their ids. The index is
+    /// written to a temporary file that replaces the old one, so a crash leaves either
+    /// the old or the new index.
+    pub fn remove_page(&mut self, page_id: PageId) -> Result<()> {
+        let mut entries = vec![0; (self.offset - 8 - 1) as usize];
+        self.index_file
+            .read_exact_at(9, &mut entries)
+            .map_err(ZeboError::OperationError)?;
+
+        let mut content = Vec::with_capacity(9 + entries.len());
+        content.push(Version::V1.into());
+        content.extend_from_slice(&[0; 8]);
+        for entry in entries.as_chunks::<16>().0 {
+            if entry[0..8] != page_id.0.to_be_bytes() {
+                content.extend_from_slice(entry);
+            }
+        }
+        let offset = content.len() as u64;
+        content[1..9].copy_from_slice(&offset.to_be_bytes());
+
+        let temp_path = self.index_file_path.with_extension("index.tmp");
+        let mut temp_file = std::fs::File::create(&temp_path).map_err(ZeboError::OperationError)?;
+        temp_file
+            .write_all(&content)
+            .map_err(ZeboError::OperationError)?;
+        temp_file.sync_all().map_err(ZeboError::OperationError)?;
+        drop(temp_file);
+        std::fs::rename(&temp_path, &self.index_file_path).map_err(ZeboError::OperationError)?;
+        if let Some(dir) = self.index_file_path.parent() {
+            crate::sync_dir(dir)?;
+        }
+
+        self.index_file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&self.index_file_path)
+            .map_err(ZeboError::OperationError)?;
+        self.offset = offset;
+
+        Ok(())
+    }
+
     pub fn get_page_ids(&self) -> Result<Vec<PageId>> {
         let mut buf = vec![0; (self.offset - 8 - 1) as usize];
         self.index_file
@@ -117,7 +155,7 @@ impl<DocId: DocumentId> ZeboIndex<DocId> {
 
         let mut pages = Vec::with_capacity(expected_page_size as usize);
 
-        for chunk in buf.chunks_exact(16) {
+        for chunk in buf.as_chunks::<16>().0 {
             let page_id = u64::from_be_bytes(chunk[0..8].try_into().unwrap());
             pages.push(PageId(page_id));
         }
@@ -142,7 +180,7 @@ impl<DocId: DocumentId> ZeboIndex<DocId> {
 
         // Pages are ordered by construction
         let mut pages = Vec::with_capacity(expected_page_size as usize);
-        for chunk in buf.chunks_exact(16) {
+        for chunk in buf.as_chunks::<16>().0 {
             let page_id = u64::from_be_bytes(chunk[0..8].try_into().unwrap());
             let starting_doc_id = u64::from_be_bytes(chunk[8..16].try_into().unwrap());
             pages.push((starting_doc_id, PageId(page_id)));
@@ -191,7 +229,7 @@ impl<DocId: DocumentId> ZeboIndex<DocId> {
         let expected_page_size = (self.offset - 8 - 1) / (8 + 8);
 
         let mut pages = Vec::with_capacity(expected_page_size as usize);
-        for chunk in buf.chunks_exact(16) {
+        for chunk in buf.as_chunks::<16>().0 {
             let page_id = u64::from_be_bytes(chunk[0..8].try_into().unwrap());
             let starting_doc_id = u64::from_be_bytes(chunk[8..16].try_into().unwrap());
             pages.push((starting_doc_id, PageId(page_id)));
